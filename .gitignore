@@ -1,3 +1,11 @@
 ios/build/
 ios/*.xcodeproj
 .DS_Store
+.gradle/
+.kotlin/
+build/
+local.properties
+.idea/
+*.iml
+*.apk
+*.zip
