@@ -10,8 +10,10 @@ struct FoundDevice: Identifiable {
 
 final class BluetoothManager: NSObject, ObservableObject, CBCentralManagerDelegate, CBPeripheralDelegate {
 
-    /// The watch app will advertise this service so the phone can recognise it.
+    /// These must match the UUIDs in the watch app.
     static let watchServiceUUID = CBUUID(string: "6E5A0001-B5A3-F393-E0A9-E50E24DCCA9E")
+    static let eventUUID = CBUUID(string: "6E5A0002-B5A3-F393-E0A9-E50E24DCCA9E")
+    static let stateUUID = CBUUID(string: "6E5A0003-B5A3-F393-E0A9-E50E24DCCA9E")
 
     /// Test build: list every named Bluetooth device. Later this becomes false so only our watch shows.
     static let scanAllDevices = true
@@ -21,9 +23,15 @@ final class BluetoothManager: NSObject, ObservableObject, CBCentralManagerDelega
     @Published var isScanning = false
     @Published var connectedName: String? = nil
     @Published var statusText = ""
+    @Published var linkReady = false
+
+    /// Called with each short message the watch sends.
+    var onEvent: ((String) -> Void)?
 
     private var central: CBCentralManager!
     private var connecting: CBPeripheral?
+    private var eventChar: CBCharacteristic?
+    private var stateChar: CBCharacteristic?
     private var scanToken = 0
 
     override init() {
@@ -70,6 +78,19 @@ final class BluetoothManager: NSObject, ObservableObject, CBCentralManagerDelega
             central.cancelPeripheralConnection(p)
         }
         connectedName = nil
+        linkReady = false
+    }
+
+    /// Sends a short text message to the watch.
+    func send(_ text: String) {
+        guard let p = connecting, let c = stateChar, let data = text.data(using: .utf8) else { return }
+        p.writeValue(data, for: c, type: .withResponse)
+    }
+
+    private func clearLink() {
+        eventChar = nil
+        stateChar = nil
+        linkReady = false
     }
 
     // MARK: - CBCentralManagerDelegate
@@ -86,6 +107,7 @@ final class BluetoothManager: NSObject, ObservableObject, CBCentralManagerDelega
         } else {
             isScanning = false
             connectedName = nil
+            clearLink()
         }
     }
 
@@ -110,6 +132,8 @@ final class BluetoothManager: NSObject, ObservableObject, CBCentralManagerDelega
     func centralManager(_ central: CBCentralManager, didConnect peripheral: CBPeripheral) {
         connectedName = peripheral.name ?? "Watch"
         statusText = ""
+        peripheral.delegate = self
+        peripheral.discoverServices([Self.watchServiceUUID])
     }
 
     func centralManager(_ central: CBCentralManager, didFailToConnect peripheral: CBPeripheral, error: Error?) {
@@ -118,5 +142,37 @@ final class BluetoothManager: NSObject, ObservableObject, CBCentralManagerDelega
 
     func centralManager(_ central: CBCentralManager, didDisconnectPeripheral peripheral: CBPeripheral, error: Error?) {
         connectedName = nil
+        clearLink()
+    }
+
+    // MARK: - CBPeripheralDelegate
+
+    func peripheral(_ peripheral: CBPeripheral, didDiscoverServices error: Error?) {
+        guard let services = peripheral.services else { return }
+        for service in services where service.uuid == Self.watchServiceUUID {
+            peripheral.discoverCharacteristics([Self.eventUUID, Self.stateUUID], for: service)
+        }
+    }
+
+    func peripheral(_ peripheral: CBPeripheral, didDiscoverCharacteristicsFor service: CBService, error: Error?) {
+        guard let chars = service.characteristics else { return }
+        for c in chars {
+            if c.uuid == Self.eventUUID {
+                eventChar = c
+                peripheral.setNotifyValue(true, for: c)
+            }
+            if c.uuid == Self.stateUUID {
+                stateChar = c
+            }
+        }
+        linkReady = (eventChar != nil && stateChar != nil)
+    }
+
+    func peripheral(_ peripheral: CBPeripheral, didUpdateValueFor characteristic: CBCharacteristic, error: Error?) {
+        if characteristic.uuid == Self.eventUUID,
+           let data = characteristic.value,
+           let text = String(data: data, encoding: .utf8) {
+            onEvent?(text)
+        }
     }
 }

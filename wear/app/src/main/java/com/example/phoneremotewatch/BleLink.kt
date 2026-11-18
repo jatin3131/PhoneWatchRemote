@@ -3,6 +3,8 @@ package com.example.phoneremotewatch
 import android.annotation.SuppressLint
 import android.bluetooth.BluetoothDevice
 import android.bluetooth.BluetoothGatt
+import android.bluetooth.BluetoothGattCharacteristic
+import android.bluetooth.BluetoothGattDescriptor
 import android.bluetooth.BluetoothGattServer
 import android.bluetooth.BluetoothGattServerCallback
 import android.bluetooth.BluetoothGattService
@@ -13,6 +15,7 @@ import android.bluetooth.le.AdvertiseData
 import android.bluetooth.le.AdvertiseSettings
 import android.bluetooth.le.BluetoothLeAdvertiser
 import android.content.Context
+import android.os.Build
 import android.os.Handler
 import android.os.Looper
 import android.os.ParcelUuid
@@ -22,24 +25,33 @@ import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.setValue
 import java.util.UUID
 
-/** Makes the watch visible to the iPhone app over Bluetooth Low Energy. */
+enum class WatchMode { IDLE, GALLERY, VIEWER, ZOOM }
+
+/** Makes the watch visible to the iPhone app and carries messages both ways. */
 @SuppressLint("MissingPermission")
 class BleLink(private val context: Context) {
 
     companion object {
-        /** Must match the service UUID in the iPhone app. */
+        /** These must match the UUIDs in the iPhone app. */
         val SERVICE_UUID: UUID = UUID.fromString("6E5A0001-B5A3-F393-E0A9-E50E24DCCA9E")
+        val EVENT_UUID: UUID = UUID.fromString("6E5A0002-B5A3-F393-E0A9-E50E24DCCA9E")
+        val STATE_UUID: UUID = UUID.fromString("6E5A0003-B5A3-F393-E0A9-E50E24DCCA9E")
+        val CCCD_UUID: UUID = UUID.fromString("00002902-0000-1000-8000-00805f9b34fb")
     }
 
     var status by mutableStateOf("Not started")
     var connectedAddress by mutableStateOf<String?>(null)
     var advertising by mutableStateOf(false)
     var connectCount by mutableIntStateOf(0)
+    var dataReady by mutableStateOf(false)
+    var mode by mutableStateOf(WatchMode.IDLE)
 
     private val main = Handler(Looper.getMainLooper())
     private val manager: BluetoothManager? = context.getSystemService(BluetoothManager::class.java)
     private var server: BluetoothGattServer? = null
     private var advertiser: BluetoothLeAdvertiser? = null
+    private var eventChar: BluetoothGattCharacteristic? = null
+    private var subscribedDevice: BluetoothDevice? = null
 
     private val advertiseCallback = object : AdvertiseCallback() {
         override fun onStartSuccess(settingsInEffect: AdvertiseSettings?) {
@@ -68,6 +80,9 @@ class BleLink(private val context: Context) {
                     status = "iPhone connected"
                 } else if (newState == BluetoothProfile.STATE_DISCONNECTED) {
                     connectedAddress = null
+                    subscribedDevice = null
+                    dataReady = false
+                    mode = WatchMode.IDLE
                     status = "iPhone disconnected. Waiting again..."
                     startAdvertising()
                 }
@@ -82,6 +97,54 @@ class BleLink(private val context: Context) {
                     status = "Could not add Bluetooth service ($gattStatus)"
                 }
             }
+        }
+
+        override fun onDescriptorWriteRequest(
+            device: BluetoothDevice,
+            requestId: Int,
+            descriptor: BluetoothGattDescriptor,
+            preparedWrite: Boolean,
+            responseNeeded: Boolean,
+            offset: Int,
+            value: ByteArray
+        ) {
+            if (descriptor.uuid == CCCD_UUID) {
+                val enabled = value.isNotEmpty() && value[0].toInt() != 0
+                main.post {
+                    subscribedDevice = if (enabled) device else null
+                    dataReady = enabled
+                }
+            }
+            if (responseNeeded) {
+                server?.sendResponse(device, requestId, BluetoothGatt.GATT_SUCCESS, offset, value)
+            }
+        }
+
+        override fun onCharacteristicWriteRequest(
+            device: BluetoothDevice,
+            requestId: Int,
+            characteristic: BluetoothGattCharacteristic,
+            preparedWrite: Boolean,
+            responseNeeded: Boolean,
+            offset: Int,
+            value: ByteArray
+        ) {
+            if (characteristic.uuid == STATE_UUID) {
+                val text = String(value, Charsets.UTF_8)
+                main.post { handleState(text) }
+            }
+            if (responseNeeded) {
+                server?.sendResponse(device, requestId, BluetoothGatt.GATT_SUCCESS, offset, value)
+            }
+        }
+    }
+
+    private fun handleState(text: String) {
+        when (text.trim()) {
+            "G" -> mode = WatchMode.GALLERY
+            "V" -> mode = WatchMode.VIEWER
+            "Z" -> mode = WatchMode.ZOOM
+            "I" -> mode = WatchMode.IDLE
         }
     }
 
@@ -113,9 +176,28 @@ class BleLink(private val context: Context) {
             return
         }
         server = gattServer
-        gattServer.addService(
-            BluetoothGattService(SERVICE_UUID, BluetoothGattService.SERVICE_TYPE_PRIMARY)
+
+        val service = BluetoothGattService(SERVICE_UUID, BluetoothGattService.SERVICE_TYPE_PRIMARY)
+        val event = BluetoothGattCharacteristic(
+            EVENT_UUID,
+            BluetoothGattCharacteristic.PROPERTY_NOTIFY,
+            BluetoothGattCharacteristic.PERMISSION_READ
         )
+        event.addDescriptor(
+            BluetoothGattDescriptor(
+                CCCD_UUID,
+                BluetoothGattDescriptor.PERMISSION_READ or BluetoothGattDescriptor.PERMISSION_WRITE
+            )
+        )
+        val state = BluetoothGattCharacteristic(
+            STATE_UUID,
+            BluetoothGattCharacteristic.PROPERTY_WRITE or BluetoothGattCharacteristic.PROPERTY_WRITE_NO_RESPONSE,
+            BluetoothGattCharacteristic.PERMISSION_WRITE
+        )
+        service.addCharacteristic(event)
+        service.addCharacteristic(state)
+        eventChar = event
+        gattServer.addService(service)
         status = "Starting..."
     }
 
@@ -142,6 +224,24 @@ class BleLink(private val context: Context) {
         adv.startAdvertising(settings, data, scanResponse, advertiseCallback)
     }
 
+    /** Sends a short message to the iPhone (must stay under 20 bytes). */
+    fun sendEvent(text: String) {
+        val srv = server ?: return
+        val dev = subscribedDevice ?: return
+        val ch = eventChar ?: return
+        val bytes = text.toByteArray(Charsets.UTF_8)
+        try {
+            if (Build.VERSION.SDK_INT >= 33) {
+                srv.notifyCharacteristicChanged(dev, ch, false, bytes)
+            } else {
+                ch.value = bytes
+                srv.notifyCharacteristicChanged(dev, ch, false)
+            }
+        } catch (e: Exception) {
+            // The iPhone may have just disconnected.
+        }
+    }
+
     fun stop() {
         try {
             advertiser?.stopAdvertising(advertiseCallback)
@@ -155,7 +255,11 @@ class BleLink(private val context: Context) {
         }
         server = null
         advertiser = null
+        eventChar = null
+        subscribedDevice = null
         advertising = false
         connectedAddress = null
+        dataReady = false
+        mode = WatchMode.IDLE
     }
 }
