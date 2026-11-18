@@ -1,0 +1,122 @@
+import Foundation
+import CoreBluetooth
+
+struct FoundDevice: Identifiable {
+    let id: UUID
+    let name: String
+    var rssi: Int
+    let peripheral: CBPeripheral
+}
+
+final class BluetoothManager: NSObject, ObservableObject, CBCentralManagerDelegate, CBPeripheralDelegate {
+
+    /// The watch app will advertise this service so the phone can recognise it.
+    static let watchServiceUUID = CBUUID(string: "6E5A0001-B5A3-F393-E0A9-E50E24DCCA9E")
+
+    /// Test build: list every named Bluetooth device. Later this becomes false so only our watch shows.
+    static let scanAllDevices = true
+
+    @Published var state: CBManagerState = .unknown
+    @Published var devices: [FoundDevice] = []
+    @Published var isScanning = false
+    @Published var connectedName: String? = nil
+    @Published var statusText = ""
+
+    private var central: CBCentralManager!
+    private var connecting: CBPeripheral?
+    private var scanToken = 0
+
+    override init() {
+        super.init()
+        central = CBCentralManager(
+            delegate: self,
+            queue: nil,
+            options: [CBCentralManagerOptionShowPowerAlertKey: true]
+        )
+    }
+
+    func startScan() {
+        guard central.state == .poweredOn else { return }
+        devices.removeAll()
+        statusText = ""
+        isScanning = true
+        scanToken += 1
+        let token = scanToken
+        let services: [CBUUID]? = Self.scanAllDevices ? nil : [Self.watchServiceUUID]
+        central.scanForPeripherals(withServices: services, options: nil)
+        DispatchQueue.main.asyncAfter(deadline: .now() + 15) { [weak self] in
+            guard let self = self, self.scanToken == token else { return }
+            self.stopScan()
+        }
+    }
+
+    func stopScan() {
+        if central.isScanning {
+            central.stopScan()
+        }
+        isScanning = false
+    }
+
+    func connect(_ device: FoundDevice) {
+        stopScan()
+        connecting = device.peripheral
+        device.peripheral.delegate = self
+        statusText = "Connecting to \(device.name)..."
+        central.connect(device.peripheral, options: nil)
+    }
+
+    func disconnect() {
+        if let p = connecting {
+            central.cancelPeripheralConnection(p)
+        }
+        connectedName = nil
+    }
+
+    // MARK: - CBCentralManagerDelegate
+
+    func centralManagerDidUpdateState(_ central: CBCentralManager) {
+        state = central.state
+        if central.state == .poweredOn {
+            let existing = central.retrieveConnectedPeripherals(withServices: [Self.watchServiceUUID])
+            if let p = existing.first {
+                connecting = p
+                p.delegate = self
+                central.connect(p, options: nil)
+            }
+        } else {
+            isScanning = false
+            connectedName = nil
+        }
+    }
+
+    func centralManager(
+        _ central: CBCentralManager,
+        didDiscover peripheral: CBPeripheral,
+        advertisementData: [String: Any],
+        rssi RSSI: NSNumber
+    ) {
+        let name = peripheral.name ?? (advertisementData[CBAdvertisementDataLocalNameKey] as? String)
+        if Self.scanAllDevices && name == nil { return }
+        let label = name ?? "Watch"
+        let value = RSSI.intValue
+        if let index = devices.firstIndex(where: { $0.id == peripheral.identifier }) {
+            devices[index].rssi = value
+        } else {
+            devices.append(FoundDevice(id: peripheral.identifier, name: label, rssi: value, peripheral: peripheral))
+        }
+        devices.sort { $0.rssi > $1.rssi }
+    }
+
+    func centralManager(_ central: CBCentralManager, didConnect peripheral: CBPeripheral) {
+        connectedName = peripheral.name ?? "Watch"
+        statusText = ""
+    }
+
+    func centralManager(_ central: CBCentralManager, didFailToConnect peripheral: CBPeripheral, error: Error?) {
+        statusText = "Could not connect. Try again."
+    }
+
+    func centralManager(_ central: CBCentralManager, didDisconnectPeripheral peripheral: CBPeripheral, error: Error?) {
+        connectedName = nil
+    }
+}
