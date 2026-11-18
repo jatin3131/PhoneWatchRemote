@@ -136,6 +136,7 @@ struct ConnectView: View {
 struct MainView: View {
     @EnvironmentObject var settings: FeatureSettings
     @EnvironmentObject var ble: BluetoothManager
+    @EnvironmentObject var remote: RemoteModel
     @StateObject private var library = PhotoLibrary()
     let watchName: String
     @State private var showGallery = false
@@ -157,6 +158,10 @@ struct MainView: View {
         default:
             showDenied = true
         }
+    }
+
+    private func sendStatus() {
+        remote.sendStatus(gallery: library.hasAccess, music: false)
     }
 
     var body: some View {
@@ -221,73 +226,142 @@ struct MainView: View {
                 Text("Allow photo access in Settings to use the gallery.")
             }
         }
+        .onAppear {
+            sendStatus()
+        }
+        .onChange(of: ble.linkReady) { ready in
+            if ready {
+                sendStatus()
+            }
+        }
+        .onChange(of: library.status) { _ in
+            sendStatus()
+        }
+        .onChange(of: remote.openGalleryTick) { _ in
+            if !showGallery {
+                openGallery()
+            }
+        }
+    }
+}
+
+struct RowOffsetKey: PreferenceKey {
+    static var defaultValue: [Int: CGFloat] = [:]
+
+    static func reduce(value: inout [Int: CGFloat], nextValue: () -> [Int: CGFloat]) {
+        value.merge(nextValue()) { _, new in new }
     }
 }
 
 struct GalleryView: View {
     @ObservedObject var library: PhotoLibrary
     @EnvironmentObject var remote: RemoteModel
+    @Environment(\.dismiss) private var dismiss
 
-    private var statusLine: String {
-        if library.assets.isEmpty {
-            return "No photos found"
-        }
-        return "Row \(remote.topRow + 1). Turn the watch bezel to scroll."
+    private let spacing: CGFloat = 6
+
+    private var rowCount: Int {
+        return (library.assets.count + RemoteModel.columns - 1) / RemoteModel.columns
     }
 
-    private func cellView(row: Int, col: Int, size: CGFloat) -> some View {
-        let local = row * RemoteModel.columns + col
-        let absolute = remote.topRow * RemoteModel.columns + local
-        let isHighlighted = remote.highlighted == local
-        return Group {
-            if absolute < library.assets.count {
-                ThumbnailView(asset: library.assets[absolute])
-                    .id(library.assets[absolute].localIdentifier)
-                    .frame(width: size, height: size)
-                    .clipShape(RoundedRectangle(cornerRadius: 10))
-                    .overlay(
-                        RoundedRectangle(cornerRadius: 10)
-                            .stroke(Color.black, lineWidth: isHighlighted ? 3 : 0)
-                    )
-                    .scaleEffect(isHighlighted ? 1.22 : 1.0)
-                    .shadow(color: Color.black.opacity(isHighlighted ? 0.35 : 0), radius: 10, x: 0, y: 6)
-                    .zIndex(isHighlighted ? 1 : 0)
-                    .animation(.spring(response: 0.28, dampingFraction: 0.55), value: isHighlighted)
-                    .onTapGesture {
-                        remote.open(absolute)
-                    }
-            } else {
-                Color.clear.frame(width: size, height: size)
+    private var limitedBanner: some View {
+        Button {
+            if let url = URL(string: UIApplication.openSettingsURLString) {
+                UIApplication.shared.open(url)
             }
+        } label: {
+            Text("Only some photos are shared with this app. Tap to allow all photos.")
+                .font(.system(size: 13))
+                .foregroundColor(.black)
+                .multilineTextAlignment(.center)
+                .padding(10)
+                .frame(maxWidth: .infinity)
+                .background(Color(white: 0.94))
+                .cornerRadius(10)
         }
     }
 
-    private func gridPage(width: CGFloat) -> some View {
-        let spacing: CGFloat = 8
-        let cell = (width - spacing * CGFloat(RemoteModel.columns + 1)) / CGFloat(RemoteModel.columns)
-        return VStack(spacing: spacing) {
-            ForEach(0..<RemoteModel.rows, id: \.self) { row in
-                HStack(spacing: spacing) {
-                    ForEach(0..<RemoteModel.columns, id: \.self) { col in
-                        cellView(row: row, col: col, size: cell)
-                    }
+    @ViewBuilder
+    private func cellView(index: Int, size: CGFloat) -> some View {
+        if index < library.assets.count {
+            let asset = library.assets[index]
+            let isHighlighted = remote.highlighted == index
+            ThumbnailView(asset: asset)
+                .frame(width: size, height: size)
+                .clipShape(RoundedRectangle(cornerRadius: 10))
+                .overlay(
+                    RoundedRectangle(cornerRadius: 10)
+                        .stroke(Color.black, lineWidth: isHighlighted ? 3 : 0)
+                )
+                .scaleEffect(isHighlighted ? 1.18 : 1.0)
+                .shadow(color: Color.black.opacity(isHighlighted ? 0.35 : 0), radius: 10, x: 0, y: 6)
+                .zIndex(isHighlighted ? 1 : 0)
+                .animation(.spring(response: 0.28, dampingFraction: 0.55), value: isHighlighted)
+                .onTapGesture {
+                    remote.open(index)
                 }
-            }
+        } else {
+            Color.clear.frame(width: size, height: size)
         }
-        .padding(spacing)
     }
 
     var body: some View {
         ZStack {
             Color.white.ignoresSafeArea()
-            VStack(spacing: 0) {
-                GeometryReader { geo in
-                    gridPage(width: geo.size.width)
+            GeometryReader { geo in
+                let cell = (geo.size.width - spacing * 4) / 3
+                let rowHeight = cell + spacing
+                ScrollViewReader { proxy in
+                    ScrollView {
+                        LazyVStack(spacing: spacing) {
+                            if library.isLimited {
+                                limitedBanner
+                            }
+                            if library.assets.isEmpty {
+                                Text("No photos found")
+                                    .foregroundColor(.gray)
+                                    .padding(40)
+                            }
+                            ForEach(0..<rowCount, id: \.self) { row in
+                                HStack(spacing: spacing) {
+                                    ForEach(0..<3, id: \.self) { col in
+                                        cellView(index: row * 3 + col, size: cell)
+                                    }
+                                }
+                                .id("row-\(row)")
+                                .background(
+                                    GeometryReader { g in
+                                        Color.clear.preference(
+                                            key: RowOffsetKey.self,
+                                            value: [row: g.frame(in: .named("grid")).minY]
+                                        )
+                                    }
+                                )
+                            }
+                        }
+                        .padding(spacing)
+                    }
+                    .coordinateSpace(name: "grid")
+                    .onPreferenceChange(RowOffsetKey.self) { offsets in
+                        let visible = offsets.filter { $0.value > -rowHeight * 0.5 }
+                        if let top = visible.keys.min() {
+                            DispatchQueue.main.async {
+                                remote.syncTopRow(top)
+                            }
+                        }
+                    }
+                    .onChange(of: remote.scrollTick) { _ in
+                        withAnimation(.easeInOut(duration: 0.2)) {
+                            proxy.scrollTo("row-\(remote.topRow)", anchor: .top)
+                        }
+                    }
+                    .onAppear {
+                        remote.visibleRows = max(2, Int(geo.size.height / rowHeight))
+                    }
+                    .onChange(of: geo.size.height) { _ in
+                        remote.visibleRows = max(2, Int(geo.size.height / rowHeight))
+                    }
                 }
-                Text(statusLine)
-                    .font(.system(size: 13))
-                    .foregroundColor(.gray)
-                    .padding(.bottom, 10)
             }
             if let index = remote.openIndex, index < library.assets.count {
                 ViewerOverlay(asset: library.assets[index])
@@ -298,10 +372,13 @@ struct GalleryView: View {
         .navigationBarTitleDisplayMode(.inline)
         .toolbar(remote.openIndex != nil ? Visibility.hidden : Visibility.visible, for: .navigationBar)
         .onAppear {
-            remote.start(assetCount: library.assets.count)
+            remote.start(assets: library.assets)
         }
         .onDisappear {
             remote.stop()
+        }
+        .onChange(of: remote.exitGalleryTick) { _ in
+            dismiss()
         }
     }
 }
@@ -353,11 +430,25 @@ struct ViewerOverlay: View {
     @EnvironmentObject var remote: RemoteModel
     @State private var image: UIImage?
 
+    private var displayed: UIImage? {
+        if remote.mode == .edit, let edited = remote.editRendered {
+            return edited
+        }
+        return image
+    }
+
+    private var editLabel: String {
+        let idx = remote.lastEditIndex
+        let title = EditAttribute(rawValue: idx)?.title ?? ""
+        let value = Int(remote.editValues[idx])
+        return "\(title)  \(value > 0 ? "+" : "")\(value)"
+    }
+
     var body: some View {
         ZStack(alignment: .topTrailing) {
             Color.black.ignoresSafeArea()
-            if let image = image {
-                Image(uiImage: image)
+            if let shown = displayed {
+                Image(uiImage: shown)
                     .resizable()
                     .scaledToFit()
                     .scaleEffect(remote.zoom)
@@ -383,16 +474,30 @@ struct ViewerOverlay: View {
                     .foregroundColor(.white)
                     .padding(16)
             }
-            if !remote.notice.isEmpty {
+            if remote.mode == .edit {
                 VStack {
                     Spacer()
+                    Text(editLabel)
+                        .font(.system(size: 20, weight: .semibold))
+                        .foregroundColor(.white)
+                        .padding(.horizontal, 18)
+                        .padding(.vertical, 10)
+                        .background(Color.white.opacity(0.2))
+                        .cornerRadius(20)
+                        .padding(.bottom, 40)
+                }
+                .frame(maxWidth: .infinity)
+            }
+            if !remote.notice.isEmpty {
+                VStack {
                     Text(remote.notice)
                         .font(.system(size: 15))
                         .foregroundColor(.white)
                         .padding(12)
-                        .background(Color.white.opacity(0.2))
+                        .background(Color.white.opacity(0.25))
                         .cornerRadius(12)
-                        .padding(.bottom, 40)
+                        .padding(.top, 60)
+                    Spacer()
                 }
                 .frame(maxWidth: .infinity)
             }

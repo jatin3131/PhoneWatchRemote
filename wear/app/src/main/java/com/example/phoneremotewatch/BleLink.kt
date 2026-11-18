@@ -25,7 +25,7 @@ import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.setValue
 import java.util.UUID
 
-enum class WatchMode { IDLE, GALLERY, VIEWER, ZOOM }
+enum class WatchMode { IDLE, GALLERY, VIEWER, ZOOM, EDIT }
 
 /** Makes the watch visible to the iPhone app and carries messages both ways. */
 @SuppressLint("MissingPermission")
@@ -45,6 +45,10 @@ class BleLink(private val context: Context) {
     var connectCount by mutableIntStateOf(0)
     var dataReady by mutableStateOf(false)
     var mode by mutableStateOf(WatchMode.IDLE)
+    var phoneGallery by mutableStateOf(false)
+    var phoneMusic by mutableStateOf(false)
+    var savedTick by mutableIntStateOf(0)
+    var editSession by mutableIntStateOf(0)
 
     private val main = Handler(Looper.getMainLooper())
     private val manager: BluetoothManager? = context.getSystemService(BluetoothManager::class.java)
@@ -83,6 +87,8 @@ class BleLink(private val context: Context) {
                     subscribedDevice = null
                     dataReady = false
                     mode = WatchMode.IDLE
+                    phoneGallery = false
+                    phoneMusic = false
                     status = "iPhone disconnected. Waiting again..."
                     startAdvertising()
                 }
@@ -140,11 +146,21 @@ class BleLink(private val context: Context) {
     }
 
     private fun handleState(text: String) {
-        when (text.trim()) {
+        val parts = text.trim().split(" ")
+        when (parts[0]) {
             "G" -> mode = WatchMode.GALLERY
             "V" -> mode = WatchMode.VIEWER
             "Z" -> mode = WatchMode.ZOOM
+            "X" -> {
+                mode = WatchMode.EDIT
+                editSession += 1
+            }
             "I" -> mode = WatchMode.IDLE
+            "SD" -> savedTick += 1
+            "P" -> {
+                phoneGallery = parts.getOrNull(1) == "1"
+                phoneMusic = parts.getOrNull(2) == "1"
+            }
         }
     }
 
@@ -261,5 +277,7 @@ class BleLink(private val context: Context) {
         connectedAddress = null
         dataReady = false
         mode = WatchMode.IDLE
+        phoneGallery = false
+        phoneMusic = false
     }
 }

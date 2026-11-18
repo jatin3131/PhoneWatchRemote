@@ -4,12 +4,16 @@ import android.Manifest
 import android.content.pm.PackageManager
 import android.os.Build
 import android.os.Bundle
+import android.os.Handler
+import android.os.Looper
 import android.os.SystemClock
 import android.view.WindowManager
 import androidx.activity.ComponentActivity
+import androidx.activity.compose.BackHandler
 import androidx.activity.compose.setContent
 import androidx.activity.result.contract.ActivityResultContracts
 import androidx.compose.foundation.background
+import androidx.compose.foundation.border
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.focusable
 import androidx.compose.foundation.gestures.detectDragGestures
@@ -18,17 +22,26 @@ import androidx.compose.foundation.gestures.detectVerticalDragGestures
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
+import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.Spacer
+import androidx.compose.foundation.layout.fillMaxHeight
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
+import androidx.compose.foundation.layout.width
+import androidx.compose.foundation.pager.HorizontalPager
+import androidx.compose.foundation.pager.rememberPagerState
 import androidx.compose.foundation.shape.CircleShape
+import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableFloatStateOf
+import androidx.compose.runtime.mutableIntStateOf
+import androidx.compose.runtime.mutableStateListOf
+import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
@@ -40,12 +53,19 @@ import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.input.pointer.pointerInput
 import androidx.compose.ui.input.rotary.onRotaryScrollEvent
 import androidx.compose.ui.text.style.TextAlign
+import androidx.compose.ui.unit.Dp
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import androidx.wear.compose.material3.Button
 import androidx.wear.compose.material3.MaterialTheme
 import androidx.wear.compose.material3.Text
+import kotlinx.coroutines.delay
 import kotlin.math.abs
+
+private val attributeNames = listOf(
+    "Exposure", "Brightness", "Contrast", "Saturation", "Vibrance", "Highlights",
+    "Shadows", "Whites", "Blacks", "Gamma", "Brilliance"
+)
 
 private fun norm(value: Float, total: Int): Int {
     if (total <= 0) return 0
@@ -55,17 +75,26 @@ private fun norm(value: Float, total: Int): Int {
 class MainActivity : ComponentActivity() {
 
     private lateinit var link: BleLink
+    private val handler = Handler(Looper.getMainLooper())
+    private val editValues = mutableStateListOf(0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0)
+    private var sendPending = false
+    private var pendingIndex = 0
+    private var permissionVersion by mutableIntStateOf(0)
+    private var hintText by mutableStateOf("")
 
     private val permissionLauncher =
         registerForActivityResult(ActivityResultContracts.RequestMultiplePermissions()) {
+            permissionVersion += 1
             if (hasBlePermissions()) {
-                link.start()
+                if (!link.advertising && link.connectedAddress == null) {
+                    link.start()
+                }
             } else {
                 link.status = "Bluetooth permission was denied"
             }
         }
 
-    private fun requiredPermissions(): Array<String> {
+    private fun bleePermissionList(): Array<String> {
         return if (Build.VERSION.SDK_INT >= 31) {
             arrayOf(
                 Manifest.permission.BLUETOOTH_ADVERTISE,
@@ -77,8 +106,19 @@ class MainActivity : ComponentActivity() {
     }
 
     private fun hasBlePermissions(): Boolean {
-        return requiredPermissions().all {
+        return bleePermissionList().all {
             checkSelfPermission(it) == PackageManager.PERMISSION_GRANTED
+        }
+    }
+
+    private fun hasNotificationPermission(): Boolean {
+        return Build.VERSION.SDK_INT < 33 ||
+            checkSelfPermission(Manifest.permission.POST_NOTIFICATIONS) == PackageManager.PERMISSION_GRANTED
+    }
+
+    private fun requestNotifications() {
+        if (Build.VERSION.SDK_INT >= 33 && !hasNotificationPermission()) {
+            permissionLauncher.launch(arrayOf(Manifest.permission.POST_NOTIFICATIONS))
         }
     }
 
@@ -86,8 +126,18 @@ class MainActivity : ComponentActivity() {
         if (hasBlePermissions()) {
             link.start()
         } else {
-            permissionLauncher.launch(requiredPermissions())
+            permissionLauncher.launch(bleePermissionList())
         }
+    }
+
+    private fun requestSend(index: Int) {
+        pendingIndex = index
+        if (sendPending) return
+        sendPending = true
+        handler.postDelayed({
+            sendPending = false
+            link.sendEvent("E $pendingIndex ${editValues[pendingIndex]}")
+        }, 40L)
     }
 
     override fun onCreate(savedInstanceState: Bundle?) {
@@ -103,62 +153,191 @@ class MainActivity : ComponentActivity() {
     }
 
     override fun onDestroy() {
+        handler.removeCallbacksAndMessages(null)
         link.stop()
         super.onDestroy()
     }
 
+    // ---------- Navigation ----------
+
     @Composable
     private fun AppScreen() {
+        BackHandler(enabled = link.mode != WatchMode.IDLE) {
+            when (link.mode) {
+                WatchMode.GALLERY -> link.sendEvent("XG")
+                WatchMode.VIEWER -> link.sendEvent("BK")
+                WatchMode.ZOOM -> link.sendEvent("ZD")
+                WatchMode.EDIT -> link.sendEvent("EX")
+                WatchMode.IDLE -> {}
+            }
+        }
         when (link.mode) {
-            WatchMode.IDLE -> StatusScreen()
+            WatchMode.IDLE -> HubScreen()
             WatchMode.GALLERY -> PadScreen(zoom = false)
             WatchMode.ZOOM -> PadScreen(zoom = true)
             WatchMode.VIEWER -> ViewerScreen()
+            WatchMode.EDIT -> EditScreen()
+        }
+    }
+
+    // ---------- Status page and menu ----------
+
+    @Composable
+    private fun Bubble(
+        emoji: String,
+        label: String,
+        active: Boolean,
+        size: Dp = 44.dp,
+        onClick: (() -> Unit)? = null
+    ) {
+        Column(horizontalAlignment = Alignment.CenterHorizontally) {
+            Box(
+                modifier = Modifier
+                    .size(size)
+                    .clip(CircleShape)
+                    .background(if (active) Color(0xFF244B2F) else Color(0xFF3C3C40))
+                    .border(2.dp, if (active) Color(0xFF4CAF50) else Color(0xFF58585E), CircleShape)
+                    .then(if (onClick != null) Modifier.clickable(onClick = onClick) else Modifier),
+                contentAlignment = Alignment.Center
+            ) {
+                Text(text = emoji, fontSize = (size.value * 0.42f).sp)
+            }
+            Text(
+                text = label,
+                fontSize = 9.sp,
+                color = if (active) Color(0xFFA5D6A7) else Color(0xFF9E9E9E)
+            )
         }
     }
 
     @Composable
-    private fun StatusScreen() {
-        val address = link.connectedAddress
-        val dot = when {
-            address != null -> Color(0xFF4CAF50)
-            link.advertising -> Color(0xFFFFC107)
-            else -> Color(0xFF9E9E9E)
+    private fun HubScreen() {
+        val pagerState = rememberPagerState(pageCount = { 2 })
+        Box(
+            modifier = Modifier
+                .fillMaxSize()
+                .background(Color(0xFF2B2B2E))
+        ) {
+            HorizontalPager(
+                state = pagerState,
+                modifier = Modifier.fillMaxSize()
+            ) { page ->
+                if (page == 0) {
+                    StatusPage()
+                } else {
+                    MenuPage()
+                }
+            }
+            Row(
+                modifier = Modifier
+                    .align(Alignment.BottomCenter)
+                    .padding(bottom = 8.dp),
+                horizontalArrangement = Arrangement.spacedBy(5.dp)
+            ) {
+                for (i in 0..1) {
+                    Box(
+                        modifier = Modifier
+                            .size(5.dp)
+                            .clip(CircleShape)
+                            .background(if (pagerState.currentPage == i) Color.White else Color(0xFF6A6A70))
+                    )
+                }
+            }
+        }
+    }
+
+    @Composable
+    private fun StatusPage() {
+        @Suppress("UNUSED_VARIABLE")
+        val version = permissionVersion
+        val connected = link.connectedAddress != null
+        Column(
+            modifier = Modifier
+                .fillMaxSize()
+                .padding(horizontal = 28.dp),
+            horizontalAlignment = Alignment.CenterHorizontally,
+            verticalArrangement = Arrangement.Center
+        ) {
+            Text(
+                text = if (connected) "iPhone connected" else "Not connected",
+                fontSize = 15.sp
+            )
+            Text(
+                text = if (connected) (if (link.dataReady) "data link ready" else "data link not ready") else link.status,
+                fontSize = 10.sp,
+                color = Color(0xFFAAAAAA),
+                textAlign = TextAlign.Center,
+                maxLines = 2
+            )
+            Spacer(modifier = Modifier.height(8.dp))
+            Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                Bubble("🔵", "Bluetooth", hasBlePermissions()) { startLink() }
+                Bubble("🔔", "Alerts", hasNotificationPermission()) { requestNotifications() }
+                Bubble("🎵", "Music", link.phoneMusic)
+            }
+            Spacer(modifier = Modifier.height(6.dp))
+            Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                Bubble("🖼", "Gallery", link.phoneGallery)
+                Bubble("❤", "Health", false)
+            }
+            Spacer(modifier = Modifier.height(6.dp))
+            Text(
+                text = "Restart link",
+                fontSize = 10.sp,
+                color = Color(0xFF90CAF9),
+                modifier = Modifier
+                    .clip(CircleShape)
+                    .clickable { startLink() }
+                    .padding(horizontal = 10.dp, vertical = 3.dp)
+            )
+        }
+    }
+
+    @Composable
+    private fun MenuPage() {
+        val ready = link.dataReady && link.connectedAddress != null
+        LaunchedEffect(hintText) {
+            if (hintText.isNotEmpty()) {
+                delay(2500)
+                hintText = ""
+            }
         }
         Column(
             modifier = Modifier
                 .fillMaxSize()
-                .padding(horizontal = 26.dp),
+                .padding(horizontal = 18.dp),
             horizontalAlignment = Alignment.CenterHorizontally,
             verticalArrangement = Arrangement.Center
         ) {
-            Text(text = "Phone Remote", fontSize = 14.sp)
-            Spacer(modifier = Modifier.height(6.dp))
-            Box(
-                modifier = Modifier
-                    .size(12.dp)
-                    .clip(CircleShape)
-                    .background(dot)
-            )
-            Spacer(modifier = Modifier.height(6.dp))
+            Text(text = "Open on iPhone", fontSize = 13.sp)
+            Spacer(modifier = Modifier.height(10.dp))
+            Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                Bubble("🖼", "Gallery", ready, 54.dp) {
+                    if (ready) {
+                        link.sendEvent("APP G")
+                        hintText = "Opening gallery on the iPhone..."
+                    } else {
+                        hintText = "Connect the iPhone first"
+                    }
+                }
+                Bubble("🎵", "Music", ready, 54.dp) {
+                    hintText = if (ready) "Music comes in the next build" else "Connect the iPhone first"
+                }
+                Bubble("❤", "Health", false, 54.dp) {
+                    hintText = "Health is not built yet"
+                }
+            }
+            Spacer(modifier = Modifier.height(8.dp))
             Text(
-                text = link.status,
-                fontSize = 13.sp,
+                text = if (hintText.isNotEmpty()) hintText else if (ready) "Keep the iPhone app open" else "Not connected",
+                fontSize = 10.sp,
+                color = Color(0xFFAAAAAA),
                 textAlign = TextAlign.Center
-            )
-            Text(
-                text = if (link.dataReady) "data link: ready" else "data link: not ready",
-                fontSize = 11.sp,
-                textAlign = TextAlign.Center
-            )
-            Spacer(modifier = Modifier.height(6.dp))
-            Button(
-                onClick = { startLink() },
-                modifier = Modifier.fillMaxWidth(0.8f),
-                label = { Text(text = "Restart") }
             )
         }
     }
+
+    // ---------- Gallery touchpad ----------
 
     @Composable
     private fun PadScreen(zoom: Boolean) {
@@ -226,9 +405,9 @@ class MainActivity : ComponentActivity() {
             contentAlignment = Alignment.Center
         ) {
             Text(
-                text = if (zoom) "Drag up / down or turn the bezel to zoom.\nDouble tap when done." else "Touchpad\nSlide to choose, tap to open.\nBezel scrolls.",
+                text = if (zoom) "Drag up / down or turn the bezel to zoom.\nDouble tap when done." else "Touchpad\nSlide to choose, tap to open.\nBezel scrolls.\nBack button leaves the gallery.",
                 fontSize = 12.sp,
-                color = Color(0xFFBBBBBB),
+                color = Color(0xFFCCCCCC),
                 textAlign = TextAlign.Center,
                 modifier = Modifier.padding(horizontal = 30.dp)
             )
@@ -240,6 +419,7 @@ class MainActivity : ComponentActivity() {
         Column(
             modifier = Modifier
                 .fillMaxSize()
+                .background(Color(0xFF2B2B2E))
                 .padding(horizontal = 26.dp),
             horizontalAlignment = Alignment.CenterHorizontally,
             verticalArrangement = Arrangement.Center
@@ -263,6 +443,154 @@ class MainActivity : ComponentActivity() {
                     .clip(CircleShape)
                     .clickable { link.sendEvent("BK") }
                     .padding(horizontal = 14.dp, vertical = 6.dp)
+            )
+        }
+    }
+
+    // ---------- Editor ----------
+
+    @Composable
+    private fun EditScreen() {
+        val pagerState = rememberPagerState(pageCount = { attributeNames.size })
+        val focusRequester = remember { FocusRequester() }
+        var showSaved by remember { mutableStateOf(false) }
+
+        LaunchedEffect(Unit) {
+            focusRequester.requestFocus()
+        }
+        LaunchedEffect(link.editSession) {
+            for (k in editValues.indices) {
+                editValues[k] = 0
+            }
+        }
+        LaunchedEffect(link.savedTick) {
+            if (link.savedTick > 0) {
+                showSaved = true
+                delay(1800)
+                showSaved = false
+            }
+        }
+
+        Box(
+            modifier = Modifier
+                .fillMaxSize()
+                .background(Color(0xFF232326))
+                .onRotaryScrollEvent { event ->
+                    val i = pagerState.currentPage
+                    val dy = event.verticalScrollPixels
+                    val dir = if (dy > 0f) 1 else if (dy < 0f) -1 else 0
+                    if (dir != 0) {
+                        val next = (editValues[i] + dir * 2).coerceIn(-100, 100)
+                        if (next != editValues[i]) {
+                            editValues[i] = next
+                            requestSend(i)
+                        }
+                    }
+                    true
+                }
+                .focusRequester(focusRequester)
+                .focusable()
+                .pointerInput(Unit) {
+                    detectTapGestures(onDoubleTap = {
+                        val i = pagerState.currentPage
+                        editValues[i] = 0
+                        requestSend(i)
+                    })
+                }
+        ) {
+            HorizontalPager(
+                state = pagerState,
+                modifier = Modifier.fillMaxSize()
+            ) { page ->
+                AttributePage(page)
+            }
+
+            Box(
+                modifier = Modifier
+                    .align(Alignment.TopStart)
+                    .padding(start = 36.dp, top = 36.dp)
+                    .size(36.dp)
+                    .clip(CircleShape)
+                    .background(if (showSaved) Color(0xFF2E7D32) else Color(0xFF3C3C40))
+                    .border(1.5.dp, Color(0xFF4CAF50), CircleShape)
+                    .clickable { link.sendEvent("SV") },
+                contentAlignment = Alignment.Center
+            ) {
+                Text(
+                    text = if (showSaved) "✓" else "Save",
+                    fontSize = if (showSaved) 16.sp else 10.sp
+                )
+            }
+
+            Text(
+                text = "${pagerState.currentPage + 1}/${attributeNames.size}",
+                fontSize = 10.sp,
+                color = Color(0xFF9E9E9E),
+                modifier = Modifier
+                    .align(Alignment.BottomCenter)
+                    .padding(bottom = 12.dp)
+            )
+        }
+    }
+
+    @Composable
+    private fun AttributePage(page: Int) {
+        val value = editValues[page]
+        Column(
+            modifier = Modifier
+                .fillMaxSize()
+                .padding(horizontal = 30.dp),
+            horizontalAlignment = Alignment.CenterHorizontally,
+            verticalArrangement = Arrangement.Center
+        ) {
+            Text(text = attributeNames[page], fontSize = 15.sp, color = Color(0xFFBBBBBB))
+            Spacer(modifier = Modifier.height(4.dp))
+            Text(text = if (value > 0) "+$value" else "$value", fontSize = 40.sp)
+            Spacer(modifier = Modifier.height(8.dp))
+            Row(
+                modifier = Modifier
+                    .width(110.dp)
+                    .height(6.dp)
+                    .clip(RoundedCornerShape(3.dp))
+                    .background(Color(0xFF4A4A4E))
+            ) {
+                Box(
+                    modifier = Modifier
+                        .width(55.dp)
+                        .fillMaxHeight(),
+                    contentAlignment = Alignment.CenterEnd
+                ) {
+                    if (value < 0) {
+                        Box(
+                            modifier = Modifier
+                                .width((55f * abs(value) / 100f).dp)
+                                .fillMaxHeight()
+                                .background(Color(0xFFFFB74D))
+                        )
+                    }
+                }
+                Box(
+                    modifier = Modifier
+                        .width(55.dp)
+                        .fillMaxHeight(),
+                    contentAlignment = Alignment.CenterStart
+                ) {
+                    if (value > 0) {
+                        Box(
+                            modifier = Modifier
+                                .width((55f * value / 100f).dp)
+                                .fillMaxHeight()
+                                .background(Color(0xFF64B5F6))
+                        )
+                    }
+                }
+            }
+            Spacer(modifier = Modifier.height(8.dp))
+            Text(
+                text = "bezel changes it. double tap resets.",
+                fontSize = 9.sp,
+                color = Color(0xFF8A8A8E),
+                textAlign = TextAlign.Center
             )
         }
     }

@@ -5,6 +5,9 @@ final class PhotoLibrary: ObservableObject {
     @Published var status: PHAuthorizationStatus = PHPhotoLibrary.authorizationStatus(for: .readWrite)
     @Published var assets: [PHAsset] = []
 
+    var isLimited: Bool { status == .limited }
+    var hasAccess: Bool { status == .authorized || status == .limited }
+
     func requestAccess(completion: @escaping (Bool) -> Void) {
         PHPhotoLibrary.requestAuthorization(for: .readWrite) { newStatus in
             DispatchQueue.main.async {
@@ -19,11 +22,12 @@ final class PhotoLibrary: ObservableObject {
     }
 
     func load() {
+        status = PHPhotoLibrary.authorizationStatus(for: .readWrite)
         let options = PHFetchOptions()
         options.sortDescriptors = [NSSortDescriptor(key: "creationDate", ascending: false)]
-        options.fetchLimit = 300
         let result = PHAsset.fetchAssets(with: .image, options: options)
         var list: [PHAsset] = []
+        list.reserveCapacity(result.count)
         result.enumerateObjects { asset, _, _ in
             list.append(asset)
         }
