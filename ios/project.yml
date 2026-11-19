@@ -21,9 +21,12 @@ targets:
         UILaunchScreen: {}
         UISupportedInterfaceOrientations:
           - UIInterfaceOrientationPortrait
+        UIBackgroundModes:
+          - bluetooth-central
         NSBluetoothAlwaysUsageDescription: Phone Remote uses Bluetooth to talk to your watch.
         NSPhotoLibraryUsageDescription: Phone Remote shows your photos so you can browse and edit them with your watch.
         NSPhotoLibraryAddUsageDescription: Phone Remote saves your edited photos.
+        NSAppleMusicUsageDescription: Phone Remote shows what is playing in the Music app and lets your watch control it.
     settings:
       base:
         PRODUCT_BUNDLE_IDENTIFIER: com.example.phoneremote

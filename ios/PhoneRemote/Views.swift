@@ -31,6 +31,8 @@ struct PrimaryButtonStyle: ButtonStyle {
 struct RootView: View {
     @EnvironmentObject var ble: BluetoothManager
     @EnvironmentObject var remote: RemoteModel
+    @EnvironmentObject var music: MusicManager
+    @EnvironmentObject var settings: FeatureSettings
     @State private var skipped = false
 
     var body: some View {
@@ -44,6 +46,7 @@ struct RootView: View {
         .preferredColorScheme(.light)
         .onAppear {
             remote.attach(ble)
+            music.attach(ble: ble, settings: settings)
         }
     }
 }
@@ -127,7 +130,12 @@ struct ConnectView: View {
                 }
                 .font(.system(size: 14))
                 .foregroundColor(.gray)
-                .padding(.bottom, 12)
+                .padding(.bottom, 4)
+
+                Text("build " + appBuildNumber)
+                    .font(.system(size: 11))
+                    .foregroundColor(.gray)
+                    .padding(.bottom, 8)
             }
         }
     }
@@ -137,6 +145,7 @@ struct MainView: View {
     @EnvironmentObject var settings: FeatureSettings
     @EnvironmentObject var ble: BluetoothManager
     @EnvironmentObject var remote: RemoteModel
+    @EnvironmentObject var music: MusicManager
     @StateObject private var library = PhotoLibrary()
     let watchName: String
     @State private var showGallery = false
@@ -161,7 +170,7 @@ struct MainView: View {
     }
 
     private func sendStatus() {
-        remote.sendStatus(gallery: library.hasAccess, music: false)
+        remote.sendStatus(gallery: library.hasAccess, music: music.authorized)
     }
 
     var body: some View {
@@ -176,7 +185,7 @@ struct MainView: View {
                             .font(.system(size: 15))
                             .foregroundColor(.gray)
                         Spacer()
-                        Text(ble.linkReady ? "data link ready" : "data link not ready")
+                        Text((ble.linkReady ? "data link ready" : "data link not ready") + "  |  build " + appBuildNumber)
                             .font(.system(size: 12))
                             .foregroundColor(.gray)
                     }
@@ -200,6 +209,8 @@ struct MainView: View {
                         .background(Color(white: 0.96))
                         .cornerRadius(14)
                     }
+
+                    MusicCard()
 
                     Button("Gallery") {
                         openGallery()
@@ -235,6 +246,9 @@ struct MainView: View {
             }
         }
         .onChange(of: library.status) { _ in
+            sendStatus()
+        }
+        .onChange(of: music.authorized) { _ in
             sendStatus()
         }
         .onChange(of: remote.openGalleryTick) { _ in
@@ -425,6 +439,95 @@ struct ThumbnailView: View {
     }
 }
 
+struct ValueBar: View {
+    let value: Int
+
+    var body: some View {
+        GeometryReader { geo in
+            let half = geo.size.width / 2
+            let w = half * CGFloat(abs(value)) / 100
+            ZStack(alignment: .leading) {
+                Capsule().fill(Color.white.opacity(0.2))
+                Rectangle()
+                    .fill(value >= 0 ? Color.blue : Color.orange)
+                    .frame(width: w, height: geo.size.height)
+                    .offset(x: value >= 0 ? half : half - w)
+                Rectangle()
+                    .fill(Color.white.opacity(0.6))
+                    .frame(width: 2, height: geo.size.height)
+                    .offset(x: half - 1)
+            }
+            .clipShape(Capsule())
+        }
+    }
+}
+
+struct EditPanel: View {
+    @EnvironmentObject var remote: RemoteModel
+
+    private var index: Int { remote.lastEditIndex }
+    private var value: Int { Int(remote.editValues[remote.lastEditIndex]) }
+    private var title: String { EditAttribute(rawValue: remote.lastEditIndex)?.title ?? "" }
+
+    private func valueText(_ v: Int) -> String {
+        return v > 0 ? "+\(v)" : "\(v)"
+    }
+
+    private func chip(_ attr: EditAttribute) -> some View {
+        let active = attr.rawValue == remote.lastEditIndex
+        let v = Int(remote.editValues[attr.rawValue])
+        return VStack(spacing: 2) {
+            Text(attr.title)
+                .font(.system(size: 12, weight: .semibold))
+            Text(valueText(v))
+                .font(.system(size: 12))
+        }
+        .foregroundColor(active ? Color.black : Color.white)
+        .padding(.horizontal, 12)
+        .padding(.vertical, 8)
+        .background(active ? Color.white : Color.white.opacity(0.15))
+        .cornerRadius(12)
+    }
+
+    var body: some View {
+        VStack(spacing: 10) {
+            HStack {
+                Text(title)
+                    .font(.system(size: 20, weight: .semibold))
+                    .foregroundColor(.white)
+                Spacer()
+                Text(valueText(value))
+                    .font(.system(size: 20, weight: .semibold))
+                    .foregroundColor(.white)
+            }
+            ValueBar(value: value)
+                .frame(height: 8)
+            ScrollViewReader { proxy in
+                ScrollView(.horizontal, showsIndicators: false) {
+                    HStack(spacing: 8) {
+                        ForEach(EditAttribute.allCases, id: \.rawValue) { attr in
+                            chip(attr)
+                                .id(attr.rawValue)
+                        }
+                    }
+                    .padding(.horizontal, 2)
+                }
+                .onChange(of: remote.lastEditIndex) { newIndex in
+                    withAnimation {
+                        proxy.scrollTo(newIndex, anchor: .center)
+                    }
+                }
+            }
+            Text("Turn the bezel to change it. Swipe the watch for the next tool. Press Save on the watch.")
+                .font(.system(size: 12))
+                .foregroundColor(.gray)
+                .multilineTextAlignment(.center)
+        }
+        .padding(16)
+        .background(Color(white: 0.1).ignoresSafeArea(edges: .bottom))
+    }
+}
+
 struct ViewerOverlay: View {
     let asset: PHAsset
     @EnvironmentObject var remote: RemoteModel
@@ -437,71 +540,68 @@ struct ViewerOverlay: View {
         return image
     }
 
-    private var editLabel: String {
-        let idx = remote.lastEditIndex
-        let title = EditAttribute(rawValue: idx)?.title ?? ""
-        let value = Int(remote.editValues[idx])
-        return "\(title)  \(value > 0 ? "+" : "")\(value)"
-    }
-
     var body: some View {
-        ZStack(alignment: .topTrailing) {
+        ZStack {
             Color.black.ignoresSafeArea()
-            if let shown = displayed {
-                Image(uiImage: shown)
-                    .resizable()
-                    .scaledToFit()
-                    .scaleEffect(remote.zoom)
-                    .animation(.easeOut(duration: 0.12), value: remote.zoom)
-                    .gesture(
-                        MagnificationGesture()
-                            .onChanged { value in
-                                remote.zoom = min(6, max(1, remote.pinchBase * value))
-                            }
-                            .onEnded { _ in
-                                remote.pinchBase = remote.zoom
-                            }
-                    )
-            } else {
-                ProgressView()
-                    .tint(.white)
-            }
-            Button {
-                remote.closeViewer()
-            } label: {
-                Image(systemName: "xmark.circle.fill")
-                    .font(.system(size: 30))
-                    .foregroundColor(.white)
-                    .padding(16)
-            }
-            if remote.mode == .edit {
-                VStack {
-                    Spacer()
-                    Text(editLabel)
-                        .font(.system(size: 20, weight: .semibold))
-                        .foregroundColor(.white)
-                        .padding(.horizontal, 18)
-                        .padding(.vertical, 10)
-                        .background(Color.white.opacity(0.2))
-                        .cornerRadius(20)
-                        .padding(.bottom, 40)
+            VStack(spacing: 0) {
+                ZStack {
+                    if let shown = displayed {
+                        Image(uiImage: shown)
+                            .resizable()
+                            .scaledToFit()
+                            .scaleEffect(remote.zoom)
+                            .animation(.easeOut(duration: 0.12), value: remote.zoom)
+                            .gesture(
+                                MagnificationGesture()
+                                    .onChanged { value in
+                                        remote.zoom = min(6, max(1, remote.pinchBase * value))
+                                    }
+                                    .onEnded { _ in
+                                        remote.pinchBase = remote.zoom
+                                    }
+                            )
+                    } else {
+                        ProgressView()
+                            .tint(.white)
+                    }
                 }
-                .frame(maxWidth: .infinity)
+                .frame(maxWidth: .infinity, maxHeight: .infinity)
+                .clipped()
+
+                if remote.mode == .edit {
+                    EditPanel()
+                }
+            }
+            VStack {
+                HStack {
+                    Spacer()
+                    Button {
+                        remote.closeViewer()
+                    } label: {
+                        Image(systemName: "xmark.circle.fill")
+                            .font(.system(size: 30))
+                            .foregroundColor(.white)
+                            .padding(14)
+                    }
+                }
+                Spacer()
             }
             if !remote.notice.isEmpty {
                 VStack {
                     Text(remote.notice)
-                        .font(.system(size: 15))
+                        .font(.system(size: 15, weight: .semibold))
                         .foregroundColor(.white)
+                        .multilineTextAlignment(.center)
                         .padding(12)
-                        .background(Color.white.opacity(0.25))
+                        .background(Color.white.opacity(0.28))
                         .cornerRadius(12)
+                        .padding(.horizontal, 24)
                         .padding(.top, 60)
                     Spacer()
                 }
-                .frame(maxWidth: .infinity)
             }
         }
+        .frame(maxWidth: .infinity, maxHeight: .infinity)
         .onAppear {
             load()
         }

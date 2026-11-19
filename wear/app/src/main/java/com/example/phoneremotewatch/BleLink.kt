@@ -15,14 +15,19 @@ import android.bluetooth.le.AdvertiseData
 import android.bluetooth.le.AdvertiseSettings
 import android.bluetooth.le.BluetoothLeAdvertiser
 import android.content.Context
+import android.graphics.Bitmap
+import android.graphics.BitmapFactory
 import android.os.Build
 import android.os.Handler
 import android.os.Looper
 import android.os.ParcelUuid
+import android.os.SystemClock
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableIntStateOf
+import androidx.compose.runtime.mutableLongStateOf
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.setValue
+import java.io.ByteArrayOutputStream
 import java.util.UUID
 
 enum class WatchMode { IDLE, GALLERY, VIEWER, ZOOM, EDIT }
@@ -48,7 +53,19 @@ class BleLink(private val context: Context) {
     var phoneGallery by mutableStateOf(false)
     var phoneMusic by mutableStateOf(false)
     var savedTick by mutableIntStateOf(0)
+    var saveFailTick by mutableIntStateOf(0)
     var editSession by mutableIntStateOf(0)
+
+    var musicTitle by mutableStateOf("")
+    var musicArtist by mutableStateOf("")
+    var musicPlaying by mutableStateOf(false)
+    var musicDurationSec by mutableIntStateOf(0)
+    var musicPositionSec by mutableIntStateOf(0)
+    var musicStamp by mutableLongStateOf(0L)
+    var musicArt by mutableStateOf<Bitmap?>(null)
+
+    var running = false
+    var listener: (() -> Unit)? = null
 
     private val main = Handler(Looper.getMainLooper())
     private val manager: BluetoothManager? = context.getSystemService(BluetoothManager::class.java)
@@ -57,12 +74,31 @@ class BleLink(private val context: Context) {
     private var eventChar: BluetoothGattCharacteristic? = null
     private var subscribedDevice: BluetoothDevice? = null
 
+    private var asmActive = false
+    private var asmType = 0
+    private var asmTotal = 0
+    private var asmBuf = ByteArrayOutputStream()
+
+    private fun changed() {
+        listener?.invoke()
+    }
+
+    private fun clearMusic() {
+        musicTitle = ""
+        musicArtist = ""
+        musicPlaying = false
+        musicDurationSec = 0
+        musicPositionSec = 0
+        musicArt = null
+    }
+
     private val advertiseCallback = object : AdvertiseCallback() {
         override fun onStartSuccess(settingsInEffect: AdvertiseSettings?) {
             main.post {
                 advertising = true
                 if (connectedAddress == null) {
                     status = "Waiting for the iPhone. Scan on the iPhone and tap this watch."
+                    changed()
                 }
             }
         }
@@ -82,6 +118,7 @@ class BleLink(private val context: Context) {
                     connectedAddress = device.address
                     connectCount += 1
                     status = "iPhone connected"
+                    changed()
                 } else if (newState == BluetoothProfile.STATE_DISCONNECTED) {
                     connectedAddress = null
                     subscribedDevice = null
@@ -89,7 +126,9 @@ class BleLink(private val context: Context) {
                     mode = WatchMode.IDLE
                     phoneGallery = false
                     phoneMusic = false
+                    clearMusic()
                     status = "iPhone disconnected. Waiting again..."
+                    changed()
                     startAdvertising()
                 }
             }
@@ -136,13 +175,71 @@ class BleLink(private val context: Context) {
             value: ByteArray
         ) {
             if (characteristic.uuid == STATE_UUID) {
-                val text = String(value, Charsets.UTF_8)
-                main.post { handleState(text) }
+                handleWrite(value)
             }
             if (responseNeeded) {
                 server?.sendResponse(device, requestId, BluetoothGatt.GATT_SUCCESS, offset, value)
             }
         }
+    }
+
+    /** Short text messages start with a letter. Long messages are sent in numbered pieces. */
+    @Synchronized
+    private fun handleWrite(value: ByteArray) {
+        if (value.isEmpty()) return
+        val first = value[0].toInt()
+        if (first == 1) {
+            if (value.size < 6) return
+            asmType = value[1].toInt() and 0xFF
+            asmTotal = ((value[2].toInt() and 0xFF) shl 24) or
+                ((value[3].toInt() and 0xFF) shl 16) or
+                ((value[4].toInt() and 0xFF) shl 8) or
+                (value[5].toInt() and 0xFF)
+            asmBuf = ByteArrayOutputStream()
+            asmBuf.write(value, 6, value.size - 6)
+            asmActive = true
+            finishIfComplete()
+        } else if (first == 2) {
+            if (!asmActive) return
+            asmBuf.write(value, 1, value.size - 1)
+            finishIfComplete()
+        } else {
+            val text = String(value, Charsets.UTF_8)
+            main.post { handleState(text) }
+        }
+    }
+
+    private fun finishIfComplete() {
+        if (!asmActive) return
+        if (asmBuf.size() >= asmTotal) {
+            val all = asmBuf.toByteArray()
+            val payload = if (all.size > asmTotal) all.copyOfRange(0, asmTotal) else all
+            val type = asmType
+            asmActive = false
+            main.post { applyFrame(type, payload) }
+        }
+    }
+
+    private fun applyFrame(type: Int, payload: ByteArray) {
+        when (type) {
+            0x4D -> {
+                val lines = String(payload, Charsets.UTF_8).split("\n", limit = 5)
+                musicPlaying = lines.getOrNull(0) == "1"
+                musicDurationSec = lines.getOrNull(1)?.toIntOrNull() ?: 0
+                musicPositionSec = lines.getOrNull(2)?.toIntOrNull() ?: 0
+                musicStamp = SystemClock.elapsedRealtime()
+                musicTitle = lines.getOrNull(3) ?: ""
+                musicArtist = lines.getOrNull(4) ?: ""
+            }
+            0x41 -> {
+                musicArt = if (payload.isEmpty()) {
+                    null
+                } else {
+                    BitmapFactory.decodeByteArray(payload, 0, payload.size)
+                }
+            }
+        }
+        changed()
     }
 
     private fun handleState(text: String) {
@@ -157,6 +254,7 @@ class BleLink(private val context: Context) {
             }
             "I" -> mode = WatchMode.IDLE
             "SD" -> savedTick += 1
+            "SF" -> saveFailTick += 1
             "P" -> {
                 phoneGallery = parts.getOrNull(1) == "1"
                 phoneMusic = parts.getOrNull(2) == "1"
@@ -215,6 +313,7 @@ class BleLink(private val context: Context) {
         eventChar = event
         gattServer.addService(service)
         status = "Starting..."
+        running = true
     }
 
     private fun startAdvertising() {
@@ -279,5 +378,7 @@ class BleLink(private val context: Context) {
         mode = WatchMode.IDLE
         phoneGallery = false
         phoneMusic = false
+        clearMusic()
+        running = false
     }
 }

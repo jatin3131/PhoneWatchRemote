@@ -1,6 +1,7 @@
 package com.example.phoneremotewatch
 
 import android.Manifest
+import android.content.Intent
 import android.content.pm.PackageManager
 import android.os.Build
 import android.os.Bundle
@@ -12,6 +13,8 @@ import androidx.activity.ComponentActivity
 import androidx.activity.compose.BackHandler
 import androidx.activity.compose.setContent
 import androidx.activity.result.contract.ActivityResultContracts
+import androidx.compose.foundation.Canvas
+import androidx.compose.foundation.Image
 import androidx.compose.foundation.background
 import androidx.compose.foundation.border
 import androidx.compose.foundation.clickable
@@ -40,6 +43,7 @@ import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableFloatStateOf
 import androidx.compose.runtime.mutableIntStateOf
+import androidx.compose.runtime.mutableLongStateOf
 import androidx.compose.runtime.mutableStateListOf
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
@@ -49,13 +53,21 @@ import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
 import androidx.compose.ui.focus.FocusRequester
 import androidx.compose.ui.focus.focusRequester
+import androidx.compose.ui.geometry.Offset
+import androidx.compose.ui.geometry.Size
+import androidx.compose.ui.graphics.Brush
 import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.graphics.Path
+import androidx.compose.ui.graphics.asImageBitmap
 import androidx.compose.ui.input.pointer.pointerInput
 import androidx.compose.ui.input.rotary.onRotaryScrollEvent
+import androidx.compose.ui.layout.ContentScale
 import androidx.compose.ui.text.style.TextAlign
+import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.Dp
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
+import androidx.core.content.ContextCompat
 import androidx.wear.compose.material3.Button
 import androidx.wear.compose.material3.MaterialTheme
 import androidx.wear.compose.material3.Text
@@ -67,6 +79,8 @@ private val attributeNames = listOf(
     "Shadows", "Whites", "Blacks", "Gamma", "Brilliance"
 )
 
+private enum class Glyph { PREV, NEXT, PLAY, PAUSE }
+
 private fun norm(value: Float, total: Int): Int {
     if (total <= 0) return 0
     return ((value / total.toFloat()) * 999f).toInt().coerceIn(0, 999)
@@ -74,27 +88,26 @@ private fun norm(value: Float, total: Int): Int {
 
 class MainActivity : ComponentActivity() {
 
-    private lateinit var link: BleLink
+    private val link: BleLink by lazy { LinkHolder.get(this) }
     private val handler = Handler(Looper.getMainLooper())
     private val editValues = mutableStateListOf(0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0)
     private var sendPending = false
     private var pendingIndex = 0
     private var permissionVersion by mutableIntStateOf(0)
     private var hintText by mutableStateOf("")
+    private var musicOpen by mutableStateOf(false)
 
     private val permissionLauncher =
         registerForActivityResult(ActivityResultContracts.RequestMultiplePermissions()) {
             permissionVersion += 1
             if (hasBlePermissions()) {
-                if (!link.advertising && link.connectedAddress == null) {
-                    link.start()
-                }
+                startLink(false)
             } else {
                 link.status = "Bluetooth permission was denied"
             }
         }
 
-    private fun bleePermissionList(): Array<String> {
+    private fun blePermissionList(): Array<String> {
         return if (Build.VERSION.SDK_INT >= 31) {
             arrayOf(
                 Manifest.permission.BLUETOOTH_ADVERTISE,
@@ -106,7 +119,7 @@ class MainActivity : ComponentActivity() {
     }
 
     private fun hasBlePermissions(): Boolean {
-        return bleePermissionList().all {
+        return blePermissionList().all {
             checkSelfPermission(it) == PackageManager.PERMISSION_GRANTED
         }
     }
@@ -122,12 +135,53 @@ class MainActivity : ComponentActivity() {
         }
     }
 
-    private fun startLink() {
+    private fun startLink(restart: Boolean) {
         if (hasBlePermissions()) {
-            link.start()
+            try {
+                ContextCompat.startForegroundService(
+                    this,
+                    Intent(this, LinkService::class.java)
+                        .setAction(if (restart) LinkService.ACTION_RESTART else LinkService.ACTION_START)
+                )
+            } catch (e: Exception) {
+                link.status = "Cannot start link: ${e.message}"
+            }
         } else {
-            permissionLauncher.launch(bleePermissionList())
+            permissionLauncher.launch(blePermissionList())
         }
+    }
+
+    private fun stopLink() {
+        try {
+            startService(Intent(this, LinkService::class.java).setAction(LinkService.ACTION_STOP))
+        } catch (e: Exception) {
+            link.stop()
+        }
+        finish()
+    }
+
+    private fun handleIntent(intent: Intent?) {
+        if (intent?.getBooleanExtra(LinkService.EXTRA_OPEN_MUSIC, false) == true) {
+            musicOpen = true
+        }
+    }
+
+    private fun openGalleryOnPhone() {
+        hintText = "Opening gallery on the iPhone..."
+        var attempt = 0
+        val task = object : Runnable {
+            override fun run() {
+                if (link.mode != WatchMode.IDLE) return
+                if (attempt >= 4) {
+                    hintText = "No answer. Open the Phone Remote app on the iPhone and try again."
+                    return
+                }
+                attempt += 1
+                link.sendEvent("APP G")
+                handler.postDelayed(this, 2000L)
+            }
+        }
+        handler.post(task)
     }
 
     private fun requestSend(index: Int) {
@@ -142,19 +196,19 @@ class MainActivity : ComponentActivity() {
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
-        link = BleLink(this)
         window.addFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
+        handleIntent(intent)
+        addOnNewIntentListener { handleIntent(it) }
         setContent {
             MaterialTheme {
                 AppScreen()
             }
         }
-        startLink()
+        startLink(false)
     }
 
     override fun onDestroy() {
         handler.removeCallbacksAndMessages(null)
-        link.stop()
         super.onDestroy()
     }
 
@@ -162,17 +216,17 @@ class MainActivity : ComponentActivity() {
 
     @Composable
     private fun AppScreen() {
-        BackHandler(enabled = link.mode != WatchMode.IDLE) {
+        BackHandler(enabled = link.mode != WatchMode.IDLE || musicOpen) {
             when (link.mode) {
                 WatchMode.GALLERY -> link.sendEvent("XG")
                 WatchMode.VIEWER -> link.sendEvent("BK")
                 WatchMode.ZOOM -> link.sendEvent("ZD")
                 WatchMode.EDIT -> link.sendEvent("EX")
-                WatchMode.IDLE -> {}
+                WatchMode.IDLE -> musicOpen = false
             }
         }
         when (link.mode) {
-            WatchMode.IDLE -> HubScreen()
+            WatchMode.IDLE -> if (musicOpen) MusicScreen() else HubScreen()
             WatchMode.GALLERY -> PadScreen(zoom = false)
             WatchMode.ZOOM -> PadScreen(zoom = true)
             WatchMode.VIEWER -> ViewerScreen()
@@ -263,7 +317,7 @@ class MainActivity : ComponentActivity() {
                 fontSize = 15.sp
             )
             Text(
-                text = if (connected) (if (link.dataReady) "data link ready" else "data link not ready") else link.status,
+                text = (if (connected) (if (link.dataReady) "data link ready" else "data link not ready") else link.status) + "  |  watch v5",
                 fontSize = 10.sp,
                 color = Color(0xFFAAAAAA),
                 textAlign = TextAlign.Center,
@@ -271,7 +325,7 @@ class MainActivity : ComponentActivity() {
             )
             Spacer(modifier = Modifier.height(8.dp))
             Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-                Bubble("🔵", "Bluetooth", hasBlePermissions()) { startLink() }
+                Bubble("🔵", "Bluetooth", hasBlePermissions()) { startLink(false) }
                 Bubble("🔔", "Alerts", hasNotificationPermission()) { requestNotifications() }
                 Bubble("🎵", "Music", link.phoneMusic)
             }
@@ -281,15 +335,26 @@ class MainActivity : ComponentActivity() {
                 Bubble("❤", "Health", false)
             }
             Spacer(modifier = Modifier.height(6.dp))
-            Text(
-                text = "Restart link",
-                fontSize = 10.sp,
-                color = Color(0xFF90CAF9),
-                modifier = Modifier
-                    .clip(CircleShape)
-                    .clickable { startLink() }
-                    .padding(horizontal = 10.dp, vertical = 3.dp)
-            )
+            Row(horizontalArrangement = Arrangement.spacedBy(6.dp)) {
+                Text(
+                    text = "Restart link",
+                    fontSize = 10.sp,
+                    color = Color(0xFF90CAF9),
+                    modifier = Modifier
+                        .clip(CircleShape)
+                        .clickable { startLink(true) }
+                        .padding(horizontal = 8.dp, vertical = 3.dp)
+                )
+                Text(
+                    text = "Stop link",
+                    fontSize = 10.sp,
+                    color = Color(0xFFEF9A9A),
+                    modifier = Modifier
+                        .clip(CircleShape)
+                        .clickable { stopLink() }
+                        .padding(horizontal = 8.dp, vertical = 3.dp)
+                )
+            }
         }
     }
 
@@ -309,19 +374,23 @@ class MainActivity : ComponentActivity() {
             horizontalAlignment = Alignment.CenterHorizontally,
             verticalArrangement = Arrangement.Center
         ) {
-            Text(text = "Open on iPhone", fontSize = 13.sp)
+            Text(text = "Open", fontSize = 13.sp)
             Spacer(modifier = Modifier.height(10.dp))
             Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
                 Bubble("🖼", "Gallery", ready, 54.dp) {
                     if (ready) {
-                        link.sendEvent("APP G")
+                        openGalleryOnPhone()
                         hintText = "Opening gallery on the iPhone..."
                     } else {
                         hintText = "Connect the iPhone first"
                     }
                 }
                 Bubble("🎵", "Music", ready, 54.dp) {
-                    hintText = if (ready) "Music comes in the next build" else "Connect the iPhone first"
+                    if (ready) {
+                        musicOpen = true
+                    } else {
+                        hintText = "Connect the iPhone first"
+                    }
                 }
                 Bubble("❤", "Health", false, 54.dp) {
                     hintText = "Health is not built yet"
@@ -334,6 +403,220 @@ class MainActivity : ComponentActivity() {
                 color = Color(0xFFAAAAAA),
                 textAlign = TextAlign.Center
             )
+        }
+    }
+
+    // ---------- Music ----------
+
+    @Composable
+    private fun GlyphButton(glyph: Glyph, iconSize: Dp, filled: Boolean, onClick: () -> Unit) {
+        Box(
+            modifier = Modifier
+                .size(iconSize + 20.dp)
+                .clip(CircleShape)
+                .then(if (filled) Modifier.background(Color(0xFFFF6B6B)) else Modifier)
+                .clickable(onClick = onClick),
+            contentAlignment = Alignment.Center
+        ) {
+            Canvas(modifier = Modifier.size(iconSize)) {
+                val w = size.width
+                val h = size.height
+                val tint = Color.White
+                when (glyph) {
+                    Glyph.PLAY -> {
+                        val p = Path().apply {
+                            moveTo(w * 0.25f, h * 0.12f)
+                            lineTo(w * 0.9f, h * 0.5f)
+                            lineTo(w * 0.25f, h * 0.88f)
+                            close()
+                        }
+                        drawPath(p, tint)
+                    }
+                    Glyph.PAUSE -> {
+                        drawRect(tint, Offset(w * 0.2f, h * 0.12f), Size(w * 0.2f, h * 0.76f))
+                        drawRect(tint, Offset(w * 0.6f, h * 0.12f), Size(w * 0.2f, h * 0.76f))
+                    }
+                    Glyph.NEXT -> {
+                        val p = Path().apply {
+                            moveTo(w * 0.1f, h * 0.18f)
+                            lineTo(w * 0.68f, h * 0.5f)
+                            lineTo(w * 0.1f, h * 0.82f)
+                            close()
+                        }
+                        drawPath(p, tint)
+                        drawRect(tint, Offset(w * 0.74f, h * 0.18f), Size(w * 0.16f, h * 0.64f))
+                    }
+                    Glyph.PREV -> {
+                        val p = Path().apply {
+                            moveTo(w * 0.9f, h * 0.18f)
+                            lineTo(w * 0.32f, h * 0.5f)
+                            lineTo(w * 0.9f, h * 0.82f)
+                            close()
+                        }
+                        drawPath(p, tint)
+                        drawRect(tint, Offset(w * 0.1f, h * 0.18f), Size(w * 0.16f, h * 0.64f))
+                    }
+                }
+            }
+        }
+    }
+
+    @Composable
+    private fun MusicScreen() {
+        val focusRequester = remember { FocusRequester() }
+        var acc by remember { mutableFloatStateOf(0f) }
+        var lastAction by remember { mutableLongStateOf(0L) }
+        var nowMs by remember { mutableLongStateOf(SystemClock.elapsedRealtime()) }
+
+        LaunchedEffect(Unit) {
+            focusRequester.requestFocus()
+            link.sendEvent("MR")
+        }
+        LaunchedEffect(Unit) {
+            while (true) {
+                nowMs = SystemClock.elapsedRealtime()
+                delay(500)
+            }
+        }
+
+        val hasTrack = link.musicTitle.isNotEmpty()
+        val elapsed = if (link.musicPlaying) ((nowMs - link.musicStamp) / 1000L).toInt() else 0
+        val rawPosition = (link.musicPositionSec + elapsed).coerceAtLeast(0)
+        val position = if (link.musicDurationSec > 0) minOf(rawPosition, link.musicDurationSec) else rawPosition
+        val fraction = if (link.musicDurationSec > 0) {
+            (position.toFloat() / link.musicDurationSec.toFloat()).coerceIn(0f, 1f)
+        } else {
+            0f
+        }
+
+        Box(
+            modifier = Modifier
+                .fillMaxSize()
+                .background(Brush.verticalGradient(listOf(Color(0xFF3B2A4A), Color(0xFF16161A))))
+                .onRotaryScrollEvent { event ->
+                    acc += event.verticalScrollPixels
+                    if (abs(acc) >= 10f) {
+                        val now = SystemClock.uptimeMillis()
+                        if (now - lastAction >= 250L) {
+                            link.sendEvent(if (acc > 0f) "MN" else "MV")
+                            lastAction = now
+                        }
+                        acc = 0f
+                    }
+                    true
+                }
+                .focusRequester(focusRequester)
+                .focusable()
+                .pointerInput("musicTap") {
+                    detectTapGestures(onDoubleTap = { link.sendEvent("MP") })
+                }
+                .pointerInput("musicVolume") {
+                    var total = 0f
+                    detectVerticalDragGestures(
+                        onDragStart = { total = 0f },
+                        onVerticalDrag = { _, dragAmount ->
+                            total += dragAmount
+                            if (abs(total) >= 36f) {
+                                link.sendEvent(if (total < 0f) "VU" else "VD")
+                                total = 0f
+                            }
+                        }
+                    )
+                },
+            contentAlignment = Alignment.Center
+        ) {
+            if (!hasTrack) {
+                val message = when {
+                    link.connectedAddress == null -> "Not connected"
+                    !link.phoneMusic -> "Allow music access in the iPhone app"
+                    else -> "Nothing playing.\nStart a song in the Music app on the iPhone."
+                }
+                Column(
+                    horizontalAlignment = Alignment.CenterHorizontally,
+                    modifier = Modifier.padding(horizontal = 30.dp)
+                ) {
+                    Text(text = "♪", fontSize = 34.sp, color = Color(0xFFBBBBBB))
+                    Text(
+                        text = message,
+                        fontSize = 12.sp,
+                        color = Color(0xFFCCCCCC),
+                        textAlign = TextAlign.Center
+                    )
+                }
+            } else {
+                Column(
+                    horizontalAlignment = Alignment.CenterHorizontally,
+                    verticalArrangement = Arrangement.Center,
+                    modifier = Modifier.padding(horizontal = 26.dp)
+                ) {
+                    Box(
+                        modifier = Modifier
+                            .size(56.dp)
+                            .clip(RoundedCornerShape(12.dp))
+                            .background(Color(0xFF3A3A40)),
+                        contentAlignment = Alignment.Center
+                    ) {
+                        val art = link.musicArt
+                        if (art != null) {
+                            Image(
+                                bitmap = art.asImageBitmap(),
+                                contentDescription = null,
+                                contentScale = ContentScale.Crop,
+                                modifier = Modifier.fillMaxSize()
+                            )
+                        } else {
+                            Text(text = "♪", fontSize = 26.sp, color = Color(0xFF9E9E9E))
+                        }
+                    }
+                    Spacer(modifier = Modifier.height(4.dp))
+                    Text(
+                        text = link.musicTitle,
+                        fontSize = 14.sp,
+                        maxLines = 1,
+                        overflow = TextOverflow.Ellipsis,
+                        textAlign = TextAlign.Center
+                    )
+                    Text(
+                        text = link.musicArtist,
+                        fontSize = 11.sp,
+                        color = Color(0xFFBBBBBB),
+                        maxLines = 1,
+                        overflow = TextOverflow.Ellipsis,
+                        textAlign = TextAlign.Center
+                    )
+                    Spacer(modifier = Modifier.height(5.dp))
+                    Box(
+                        modifier = Modifier
+                            .width(100.dp)
+                            .height(4.dp)
+                            .clip(RoundedCornerShape(2.dp))
+                            .background(Color(0xFF55555C))
+                    ) {
+                        Box(
+                            modifier = Modifier
+                                .fillMaxWidth(fraction)
+                                .fillMaxHeight()
+                                .background(Color(0xFFFF6B6B))
+                        )
+                    }
+                    Spacer(modifier = Modifier.height(2.dp))
+                    Row(
+                        verticalAlignment = Alignment.CenterVertically,
+                        horizontalArrangement = Arrangement.spacedBy(2.dp)
+                    ) {
+                        GlyphButton(Glyph.PREV, 16.dp, false) { link.sendEvent("MV") }
+                        GlyphButton(if (link.musicPlaying) Glyph.PAUSE else Glyph.PLAY, 18.dp, true) {
+                            link.sendEvent("MP")
+                        }
+                        GlyphButton(Glyph.NEXT, 16.dp, false) { link.sendEvent("MN") }
+                    }
+                    Text(
+                        text = "bezel: skip   swipe: volume",
+                        fontSize = 8.sp,
+                        color = Color(0xFF8A8A8E)
+                    )
+                }
+            }
         }
     }
 
@@ -453,10 +736,15 @@ class MainActivity : ComponentActivity() {
     private fun EditScreen() {
         val pagerState = rememberPagerState(pageCount = { attributeNames.size })
         val focusRequester = remember { FocusRequester() }
-        var showSaved by remember { mutableStateOf(false) }
+        var saveState by remember { mutableIntStateOf(0) }
+        val startSaved = remember { link.savedTick }
+        val startFailed = remember { link.saveFailTick }
 
         LaunchedEffect(Unit) {
             focusRequester.requestFocus()
+        }
+        LaunchedEffect(pagerState.currentPage) {
+            link.sendEvent("A ${pagerState.currentPage}")
         }
         LaunchedEffect(link.editSession) {
             for (k in editValues.indices) {
@@ -464,10 +752,25 @@ class MainActivity : ComponentActivity() {
             }
         }
         LaunchedEffect(link.savedTick) {
-            if (link.savedTick > 0) {
-                showSaved = true
-                delay(1800)
-                showSaved = false
+            if (link.savedTick > startSaved) {
+                saveState = 2
+                delay(2000)
+                saveState = 0
+            }
+        }
+        LaunchedEffect(link.saveFailTick) {
+            if (link.saveFailTick > startFailed) {
+                saveState = 3
+                delay(3500)
+                saveState = 0
+            }
+        }
+        LaunchedEffect(saveState) {
+            if (saveState == 1) {
+                delay(8000)
+                if (saveState == 1) {
+                    saveState = 0
+                }
             }
         }
 
@@ -511,19 +814,38 @@ class MainActivity : ComponentActivity() {
                     .padding(start = 36.dp, top = 36.dp)
                     .size(36.dp)
                     .clip(CircleShape)
-                    .background(if (showSaved) Color(0xFF2E7D32) else Color(0xFF3C3C40))
+                    .background(
+                        when (saveState) {
+                            2 -> Color(0xFF2E7D32)
+                            3 -> Color(0xFFB71C1C)
+                            else -> Color(0xFF3C3C40)
+                        }
+                    )
                     .border(1.5.dp, Color(0xFF4CAF50), CircleShape)
-                    .clickable { link.sendEvent("SV") },
+                    .clickable {
+                        saveState = 1
+                        link.sendEvent("SV")
+                    },
                 contentAlignment = Alignment.Center
             ) {
                 Text(
-                    text = if (showSaved) "✓" else "Save",
-                    fontSize = if (showSaved) 16.sp else 10.sp
+                    text = when (saveState) {
+                        1 -> "..."
+                        2 -> "✓"
+                        3 -> "✗"
+                        else -> "Save"
+                    },
+                    fontSize = if (saveState == 0) 10.sp else 16.sp
                 )
             }
 
             Text(
-                text = "${pagerState.currentPage + 1}/${attributeNames.size}",
+                text = when (saveState) {
+                    1 -> "saving..."
+                    2 -> "saved to Photos"
+                    3 -> "save failed - see iPhone"
+                    else -> "${pagerState.currentPage + 1}/${attributeNames.size}"
+                },
                 fontSize = 10.sp,
                 color = Color(0xFF9E9E9E),
                 modifier = Modifier

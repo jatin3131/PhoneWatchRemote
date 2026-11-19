@@ -128,6 +128,8 @@ final class RemoteModel: ObservableObject {
     @Published var lastEditIndex = 0
 
     var pinchBase: CGFloat = 1.0
+    var lastGallery = false
+    var lastMusic = false
 
     private weak var ble: BluetoothManager?
     private var assets: [PHAsset] = []
@@ -145,6 +147,8 @@ final class RemoteModel: ObservableObject {
     }
 
     func sendStatus(gallery: Bool, music: Bool) {
+        lastGallery = gallery
+        lastMusic = music
         ble?.send("P \(gallery ? 1 : 0) \(music ? 1 : 0)")
     }
 
@@ -209,6 +213,8 @@ final class RemoteModel: ObservableObject {
             if parts.count >= 2 && parts[1] == "G" {
                 openGalleryTick += 1
             }
+        case "MR":
+            ble?.send("P \(lastGallery ? 1 : 0) \(lastMusic ? 1 : 0)")
         case "XG":
             if mode != .idle {
                 exitGalleryTick += 1
@@ -250,6 +256,9 @@ final class RemoteModel: ObservableObject {
             if mode == .viewer {
                 startEdit()
             }
+        case "A":
+            guard mode == .edit, parts.count >= 2, let i = Int(parts[1]), i >= 0, i < editValues.count else { return }
+            lastEditIndex = i
         case "E":
             guard mode == .edit, parts.count >= 3, let i = Int(parts[1]), let value = Double(parts[2]),
                   i >= 0, i < editValues.count else { return }
@@ -259,6 +268,9 @@ final class RemoteModel: ObservableObject {
         case "SV":
             if mode == .edit {
                 saveEdit()
+            } else {
+                showNotice("Save pressed, but no photo is being edited")
+                ble?.send("SF")
             }
         case "EX":
             if mode == .edit {
@@ -351,8 +363,18 @@ final class RemoteModel: ObservableObject {
         }
     }
 
+    private func failSave(_ message: String) {
+        DispatchQueue.main.async {
+            self.showNotice(message)
+            self.ble?.send("SF")
+        }
+    }
+
     private func saveEdit() {
-        guard let asset = currentAsset else { return }
+        guard let asset = currentAsset else {
+            failSave("No photo is open")
+            return
+        }
         let values = editValues
         showNotice("Saving...")
 
@@ -361,37 +383,38 @@ final class RemoteModel: ObservableObject {
         options.isNetworkAccessAllowed = true
         PHImageManager.default().requestImage(
             for: asset,
-            targetSize: CGSize(width: 4096, height: 4096),
+            targetSize: CGSize(width: 3000, height: 3000),
             contentMode: .aspectFit,
             options: options
         ) { [weak self] image, _ in
             guard let self = self else { return }
             guard let image = image else {
-                DispatchQueue.main.async { self.showNotice("Could not load the photo") }
+                self.failSave("Save failed: could not load the photo")
                 return
             }
             self.renderQueue.async {
-                let up = PhotoEditor.upright(image, maxSide: 4096)
+                let up = PhotoEditor.upright(image, maxSide: 3000)
                 guard let ci = CIImage(image: up) else {
-                    DispatchQueue.main.async { self.showNotice("Could not save") }
+                    self.failSave("Save failed: could not read the photo")
                     return
                 }
                 let out = PhotoEditor.apply(values, to: ci)
                 guard let finished = PhotoEditor.render(out, extent: ci.extent),
                       let data = finished.jpegData(compressionQuality: 0.92) else {
-                    DispatchQueue.main.async { self.showNotice("Could not save") }
+                    self.failSave("Save failed: could not render the photo")
                     return
                 }
                 PHPhotoLibrary.shared().performChanges({
                     let request = PHAssetCreationRequest.forAsset()
                     request.addResource(with: .photo, data: data, options: nil)
-                }) { ok, _ in
+                }) { ok, error in
                     DispatchQueue.main.async {
                         if ok {
                             self.ble?.send("SD")
                             self.showNotice("Saved to Photos")
                         } else {
-                            self.showNotice("Could not save")
+                            let reason = error?.localizedDescription ?? "unknown reason"
+                            self.failSave("Save failed: \(reason)")
                         }
                     }
                 }
@@ -401,8 +424,10 @@ final class RemoteModel: ObservableObject {
 
     private func showNotice(_ text: String) {
         notice = text
-        DispatchQueue.main.asyncAfter(deadline: .now() + 3) { [weak self] in
-            self?.notice = ""
+        DispatchQueue.main.asyncAfter(deadline: .now() + 5) { [weak self] in
+            if self?.notice == text {
+                self?.notice = ""
+            }
         }
     }
 }

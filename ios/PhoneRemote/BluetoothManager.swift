@@ -25,14 +25,18 @@ final class BluetoothManager: NSObject, ObservableObject, CBCentralManagerDelega
     @Published var statusText = ""
     @Published var linkReady = false
 
-    /// Called with each short message the watch sends.
+    /// Called with each short message the watch sends (gallery and editor).
     var onEvent: ((String) -> Void)?
+    /// Called with each short message the watch sends (music).
+    var onMusicEvent: ((String) -> Void)?
 
     private var central: CBCentralManager!
     private var connecting: CBPeripheral?
     private var eventChar: CBCharacteristic?
     private var stateChar: CBCharacteristic?
     private var scanToken = 0
+    private var writeQueue: [Data] = []
+    private var writing = false
 
     override init() {
         super.init()
@@ -81,9 +85,49 @@ final class BluetoothManager: NSObject, ObservableObject, CBCentralManagerDelega
         linkReady = false
     }
 
+    // MARK: - Sending to the watch (one write at a time, in order)
+
     /// Sends a short text message to the watch.
     func send(_ text: String) {
-        guard let p = connecting, let c = stateChar, let data = text.data(using: .utf8) else { return }
+        guard let data = text.data(using: .utf8) else { return }
+        enqueue(data)
+    }
+
+    /// Sends a longer message (for example a title or a picture) in numbered pieces.
+    func sendMessage(type: UInt8, payload: Data) {
+        guard let p = connecting, stateChar != nil else { return }
+        let size = max(20, p.maximumWriteValueLength(for: .withoutResponse))
+
+        var first = Data([0x01, type])
+        var total = UInt32(payload.count).bigEndian
+        withUnsafeBytes(of: &total) { first.append(contentsOf: $0) }
+        let room = size - first.count
+        let firstCount = min(room, payload.count)
+        if firstCount > 0 {
+            first.append(payload.prefix(firstCount))
+        }
+        enqueue(first)
+
+        var offset = firstCount
+        while offset < payload.count {
+            let n = min(size - 1, payload.count - offset)
+            var packet = Data([0x02])
+            packet.append(payload.subdata(in: offset..<(offset + n)))
+            enqueue(packet)
+            offset += n
+        }
+    }
+
+    private func enqueue(_ data: Data) {
+        guard stateChar != nil else { return }
+        writeQueue.append(data)
+        pump()
+    }
+
+    private func pump() {
+        guard !writing, let p = connecting, let c = stateChar, !writeQueue.isEmpty else { return }
+        writing = true
+        let data = writeQueue.removeFirst()
         p.writeValue(data, for: c, type: .withResponse)
     }
 
@@ -91,6 +135,8 @@ final class BluetoothManager: NSObject, ObservableObject, CBCentralManagerDelega
         eventChar = nil
         stateChar = nil
         linkReady = false
+        writeQueue.removeAll()
+        writing = false
     }
 
     // MARK: - CBCentralManagerDelegate
@@ -168,11 +214,17 @@ final class BluetoothManager: NSObject, ObservableObject, CBCentralManagerDelega
         linkReady = (eventChar != nil && stateChar != nil)
     }
 
+    func peripheral(_ peripheral: CBPeripheral, didWriteValueFor characteristic: CBCharacteristic, error: Error?) {
+        writing = false
+        pump()
+    }
+
     func peripheral(_ peripheral: CBPeripheral, didUpdateValueFor characteristic: CBCharacteristic, error: Error?) {
         if characteristic.uuid == Self.eventUUID,
            let data = characteristic.value,
            let text = String(data: data, encoding: .utf8) {
             onEvent?(text)
+            onMusicEvent?(text)
         }
     }
 }

@@ -10,7 +10,7 @@ final class FeatureSettings: ObservableObject {
 
     static let features: [Feature] = [
         Feature(id: "bluetooth", title: "Bluetooth link", detail: "Direct connection between iPhone and watch"),
-        Feature(id: "media", title: "Media controls", detail: "Play, pause and skip from the watch (this app's audio)"),
+        Feature(id: "media", title: "Media controls", detail: "What is playing in the Music app, shown and controlled from the watch"),
         Feature(id: "proximity", title: "Proximity alert", detail: "Watch buzzes if the phone is left behind"),
         Feature(id: "gestures", title: "Watch gestures", detail: "Taps and swipes to navigate and toggle options"),
         Feature(id: "gallery", title: "Photo gallery", detail: "Browse photos with the watch touchpad"),

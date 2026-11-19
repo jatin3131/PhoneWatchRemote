@@ -12,6 +12,10 @@ jobs:
       - name: Check out code
         uses: actions/checkout@v4
 
+      - name: Stamp build number
+        run: |
+          echo "let appBuildNumber = \"${{ github.run_number }}\"" > ios/PhoneRemote/BuildInfo.swift
+
       - name: Install XcodeGen
         run: brew install xcodegen
 
@@ -41,11 +45,11 @@ jobs:
           rm -rf Payload
           mkdir Payload
           cp -R PhoneRemote.app Payload/
-          zip -qry PhoneRemote.ipa Payload
+          zip -qry PhoneRemote-build${{ github.run_number }}.ipa Payload
 
       - name: Upload IPA
         uses: actions/upload-artifact@v4
         with:
-          name: PhoneRemote-ipa
-          path: ios/build/Build/Products/Release-iphoneos/PhoneRemote.ipa
+          name: PhoneRemote-build${{ github.run_number }}
+          path: ios/build/Build/Products/Release-iphoneos/PhoneRemote-build${{ github.run_number }}.ipa
           retention-days: 30
