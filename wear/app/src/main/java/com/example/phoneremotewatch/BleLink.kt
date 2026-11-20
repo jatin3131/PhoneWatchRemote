@@ -138,6 +138,7 @@ class BleLink(private val context: Context) {
     private var amsRetries = 0
     private var receiverRegistered = false
     private var contactsRequested = false
+    private val liveLinks = HashSet<String>()
 
     private val notifyQueue = ArrayDeque<ByteArray>()
     private var notifyBusy = false
@@ -295,7 +296,6 @@ class BleLink(private val context: Context) {
             .setIncludeDeviceName(true)
             .build()
         adv.startAdvertising(settings, data, scanResponse, advertiseCallback)
-        startSolicitation()
     }
 
     private val heartbeat = object : Runnable {
@@ -304,6 +304,9 @@ class BleLink(private val context: Context) {
             if (connectedAddress == null && btOn) {
                 startAdvertising()
             }
+            if (connectedAddress != null && !amsReady && clientGatt == null && phoneDevice != null) {
+                startAms()
+            }
             main.postDelayed(this, 30000L)
         }
     }
@@ -311,6 +314,7 @@ class BleLink(private val context: Context) {
     // ---------- Connection from the iPhone ----------
 
     private fun onPhoneDisconnected() {
+        liveLinks.clear()
         connectedAddress = null
         subscribedDevice = null
         dataReady = false
@@ -336,6 +340,10 @@ class BleLink(private val context: Context) {
         override fun onConnectionStateChange(device: BluetoothDevice, gattStatus: Int, newState: Int) {
             main.post {
                 if (newState == BluetoothProfile.STATE_CONNECTED) {
+                    liveLinks.add(device.address)
+                    if (connectedAddress == device.address && (amsReady || clientGatt != null)) {
+                        return@post
+                    }
                     connectedAddress = device.address
                     connectCount += 1
                     status = "iPhone connected"
@@ -346,7 +354,10 @@ class BleLink(private val context: Context) {
                     changed()
                     main.postDelayed({ startAms() }, 2500L)
                 } else if (newState == BluetoothProfile.STATE_DISCONNECTED) {
-                    onPhoneDisconnected()
+                    liveLinks.remove(device.address)
+                    if (liveLinks.isEmpty()) {
+                        onPhoneDisconnected()
+                    }
                 }
             }
         }
@@ -712,13 +723,13 @@ class BleLink(private val context: Context) {
     }
 
     private fun scheduleAmsRetry() {
-        if (amsRetries >= 3) return
+        if (amsRetries >= 30) return
         amsRetries += 1
         main.postDelayed({
             if (!amsReady && connectedAddress != null) {
                 startAms()
             }
-        }, 20000L)
+        }, 12000L)
     }
 
     private fun needPairing() {
@@ -1189,6 +1200,7 @@ class BleLink(private val context: Context) {
         notifyQueue.clear()
         notifyBusy = false
         contactsRequested = false
+        liveLinks.clear()
         advertising = false
         connectedAddress = null
         dataReady = false

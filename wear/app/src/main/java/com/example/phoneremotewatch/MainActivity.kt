@@ -426,7 +426,7 @@ class MainActivity : ComponentActivity() {
                 fontSize = 14.sp
             )
             Text(
-                text = (if (connected) (if (link.dataReady) "data link ready" else "data link not ready") else link.status) + "  |  watch v8",
+                text = (if (connected) (if (link.dataReady) "data link ready" else "data link not ready") else link.status) + "  |  watch v9  |  media: " + link.amsStatus,
                 fontSize = 9.sp,
                 color = Color(0xFFAAAAAA),
                 textAlign = TextAlign.Center,
@@ -443,7 +443,7 @@ class MainActivity : ComponentActivity() {
                         }
                     } else {
                         startLink(false)
-                        hintText = "Beacon: " + link.solicitStatus
+                        hintText = "Music: " + link.amsStatus
                     }
                 }
                 Bubble("🔔", "Alerts", hasNotificationPermission(), 36.dp) { requestNotifications() }
