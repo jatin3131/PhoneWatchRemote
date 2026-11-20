@@ -68,6 +68,8 @@ import androidx.compose.ui.unit.Dp
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import androidx.core.content.ContextCompat
+import androidx.wear.compose.foundation.lazy.ScalingLazyColumn
+import androidx.wear.compose.foundation.lazy.items
 import androidx.wear.compose.material3.Button
 import androidx.wear.compose.material3.MaterialTheme
 import androidx.wear.compose.material3.Text
@@ -78,6 +80,8 @@ private val attributeNames = listOf(
     "Exposure", "Brightness", "Contrast", "Saturation", "Vibrance", "Highlights",
     "Shadows", "Whites", "Blacks", "Gamma", "Brilliance"
 )
+
+private val hapticNames = listOf("Battery saver", "Medium", "High")
 
 private enum class Glyph { PREV, NEXT, PLAY, PAUSE }
 
@@ -96,6 +100,8 @@ class MainActivity : ComponentActivity() {
     private var permissionVersion by mutableIntStateOf(0)
     private var hintText by mutableStateOf("")
     private var musicOpen by mutableStateOf(false)
+    private var contactsOpen by mutableStateOf(false)
+    private var hiddenCallTick by mutableIntStateOf(-1)
 
     private val permissionLauncher =
         registerForActivityResult(ActivityResultContracts.RequestMultiplePermissions()) {
@@ -104,6 +110,16 @@ class MainActivity : ComponentActivity() {
                 startLink(false)
             } else {
                 link.status = "Bluetooth permission was denied"
+            }
+        }
+
+    private val micLauncher =
+        registerForActivityResult(ActivityResultContracts.RequestPermission()) { granted ->
+            permissionVersion += 1
+            if (granted) {
+                link.changeHapticsOn(true)
+            } else {
+                hintText = "Microphone permission was denied"
             }
         }
 
@@ -129,9 +145,23 @@ class MainActivity : ComponentActivity() {
             checkSelfPermission(Manifest.permission.POST_NOTIFICATIONS) == PackageManager.PERMISSION_GRANTED
     }
 
+    private fun hasMic(): Boolean {
+        return checkSelfPermission(Manifest.permission.RECORD_AUDIO) == PackageManager.PERMISSION_GRANTED
+    }
+
     private fun requestNotifications() {
         if (Build.VERSION.SDK_INT >= 33 && !hasNotificationPermission()) {
             permissionLauncher.launch(arrayOf(Manifest.permission.POST_NOTIFICATIONS))
+        }
+    }
+
+    private fun toggleHaptics() {
+        if (link.hapticsOn) {
+            link.changeHapticsOn(false)
+        } else if (hasMic()) {
+            link.changeHapticsOn(true)
+        } else {
+            micLauncher.launch(Manifest.permission.RECORD_AUDIO)
         }
     }
 
@@ -163,6 +193,7 @@ class MainActivity : ComponentActivity() {
     private fun handleIntent(intent: Intent?) {
         if (intent?.getBooleanExtra(LinkService.EXTRA_OPEN_MUSIC, false) == true) {
             musicOpen = true
+            contactsOpen = false
         }
     }
 
@@ -216,25 +247,49 @@ class MainActivity : ComponentActivity() {
 
     @Composable
     private fun AppScreen() {
-        BackHandler(enabled = link.mode != WatchMode.IDLE || musicOpen) {
-            when (link.mode) {
-                WatchMode.GALLERY -> link.sendEvent("XG")
-                WatchMode.VIEWER -> link.sendEvent("BK")
-                WatchMode.ZOOM -> link.sendEvent("ZD")
-                WatchMode.EDIT -> link.sendEvent("EX")
-                WatchMode.IDLE -> musicOpen = false
+        val showCall = link.callActive && hiddenCallTick != link.callTick
+
+        LaunchedEffect(link.callActive) {
+            setShowWhenLocked(link.callActive)
+            setTurnScreenOn(link.callActive)
+        }
+
+        BackHandler(
+            enabled = showCall || link.mode != WatchMode.IDLE || musicOpen || contactsOpen
+        ) {
+            when {
+                showCall -> hiddenCallTick = link.callTick
+                link.mode == WatchMode.GALLERY -> link.sendEvent("XG")
+                link.mode == WatchMode.VIEWER -> link.sendEvent("BK")
+                link.mode == WatchMode.ZOOM -> link.sendEvent("ZD")
+                link.mode == WatchMode.EDIT -> link.sendEvent("EX")
+                contactsOpen -> contactsOpen = false
+                musicOpen -> musicOpen = false
             }
         }
-        when (link.mode) {
-            WatchMode.IDLE -> if (musicOpen) MusicScreen() else HubScreen()
-            WatchMode.GALLERY -> PadScreen(zoom = false)
-            WatchMode.ZOOM -> PadScreen(zoom = true)
-            WatchMode.VIEWER -> ViewerScreen()
-            WatchMode.EDIT -> EditScreen()
+
+        if (showCall) {
+            CallScreen()
+        } else {
+            when (link.mode) {
+                WatchMode.IDLE -> {
+                    if (contactsOpen) {
+                        ContactsScreen()
+                    } else if (musicOpen) {
+                        MusicScreen()
+                    } else {
+                        HubScreen()
+                    }
+                }
+                WatchMode.GALLERY -> PadScreen(zoom = false)
+                WatchMode.ZOOM -> PadScreen(zoom = true)
+                WatchMode.VIEWER -> ViewerScreen()
+                WatchMode.EDIT -> EditScreen()
+            }
         }
     }
 
-    // ---------- Status page and menu ----------
+    // ---------- Status page, menu and settings ----------
 
     @Composable
     private fun Bubble(
@@ -258,7 +313,7 @@ class MainActivity : ComponentActivity() {
             }
             Text(
                 text = label,
-                fontSize = 9.sp,
+                fontSize = 8.sp,
                 color = if (active) Color(0xFFA5D6A7) else Color(0xFF9E9E9E)
             )
         }
@@ -266,7 +321,7 @@ class MainActivity : ComponentActivity() {
 
     @Composable
     private fun HubScreen() {
-        val pagerState = rememberPagerState(pageCount = { 2 })
+        val pagerState = rememberPagerState(pageCount = { 3 })
         Box(
             modifier = Modifier
                 .fillMaxSize()
@@ -276,10 +331,10 @@ class MainActivity : ComponentActivity() {
                 state = pagerState,
                 modifier = Modifier.fillMaxSize()
             ) { page ->
-                if (page == 0) {
-                    StatusPage()
-                } else {
-                    MenuPage()
+                when (page) {
+                    0 -> StatusPage()
+                    1 -> MenuPage()
+                    else -> SettingsPage()
                 }
             }
             Row(
@@ -288,7 +343,7 @@ class MainActivity : ComponentActivity() {
                     .padding(bottom = 8.dp),
                 horizontalArrangement = Arrangement.spacedBy(5.dp)
             ) {
-                for (i in 0..1) {
+                for (i in 0..2) {
                     Box(
                         modifier = Modifier
                             .size(5.dp)
@@ -305,36 +360,64 @@ class MainActivity : ComponentActivity() {
         @Suppress("UNUSED_VARIABLE")
         val version = permissionVersion
         val connected = link.connectedAddress != null
+        LaunchedEffect(hintText) {
+            if (hintText.isNotEmpty()) {
+                delay(3500)
+                hintText = ""
+            }
+        }
         Column(
             modifier = Modifier
                 .fillMaxSize()
-                .padding(horizontal = 28.dp),
+                .padding(horizontal = 26.dp),
             horizontalAlignment = Alignment.CenterHorizontally,
             verticalArrangement = Arrangement.Center
         ) {
             Text(
                 text = if (connected) "iPhone connected" else "Not connected",
-                fontSize = 15.sp
+                fontSize = 14.sp
             )
             Text(
-                text = (if (connected) (if (link.dataReady) "data link ready" else "data link not ready") else link.status) + "  |  watch v5",
-                fontSize = 10.sp,
+                text = (if (connected) (if (link.dataReady) "data link ready" else "data link not ready") else link.status) + "  |  watch v7",
+                fontSize = 9.sp,
                 color = Color(0xFFAAAAAA),
                 textAlign = TextAlign.Center,
                 maxLines = 2
             )
-            Spacer(modifier = Modifier.height(8.dp))
-            Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-                Bubble("🔵", "Bluetooth", hasBlePermissions()) { startLink(false) }
-                Bubble("🔔", "Alerts", hasNotificationPermission()) { requestNotifications() }
-                Bubble("🎵", "Music", link.phoneMusic)
-            }
             Spacer(modifier = Modifier.height(6.dp))
-            Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-                Bubble("🖼", "Gallery", link.phoneGallery)
-                Bubble("❤", "Health", false)
+            Row(horizontalArrangement = Arrangement.spacedBy(5.dp)) {
+                Bubble("🔵", "Bluetooth", hasBlePermissions(), 36.dp) { startLink(false) }
+                Bubble("🔔", "Alerts", hasNotificationPermission(), 36.dp) { requestNotifications() }
+                Bubble("🎵", "Music", link.phoneMusic || link.amsReady, 36.dp) {
+                    hintText = "Music: " + link.amsStatus
+                }
+                Bubble("🖼", "Gallery", link.phoneGallery, 36.dp)
             }
-            Spacer(modifier = Modifier.height(6.dp))
+            Spacer(modifier = Modifier.height(4.dp))
+            Row(horizontalArrangement = Arrangement.spacedBy(5.dp)) {
+                Bubble("❤", "Health", false, 36.dp)
+                Bubble("📞", "Calls", link.ancsReady && link.shareCalls, 36.dp) {
+                    hintText = "Calls: " + link.ancsStatus
+                }
+                Bubble("👤", "Contacts", link.contactCount > 0, 36.dp) {
+                    hintText = if (link.contactCount > 0) {
+                        "${link.contactCount} contacts synced"
+                    } else {
+                        "Turn on Contacts sync in the iPhone app"
+                    }
+                }
+                Bubble("🎙", "Mic", hasMic(), 36.dp) {
+                    if (!hasMic()) micLauncher.launch(Manifest.permission.RECORD_AUDIO)
+                }
+            }
+            Spacer(modifier = Modifier.height(4.dp))
+            Text(
+                text = if (hintText.isNotEmpty()) hintText else "tap a bubble for details",
+                fontSize = 9.sp,
+                color = Color(0xFFB0BEC5),
+                textAlign = TextAlign.Center,
+                maxLines = 2
+            )
             Row(horizontalArrangement = Arrangement.spacedBy(6.dp)) {
                 Text(
                     text = "Restart link",
@@ -375,34 +458,268 @@ class MainActivity : ComponentActivity() {
             verticalArrangement = Arrangement.Center
         ) {
             Text(text = "Open", fontSize = 13.sp)
-            Spacer(modifier = Modifier.height(10.dp))
-            Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-                Bubble("🖼", "Gallery", ready, 54.dp) {
+            Spacer(modifier = Modifier.height(8.dp))
+            Row(horizontalArrangement = Arrangement.spacedBy(12.dp)) {
+                Bubble("🖼", "Gallery", ready, 48.dp) {
                     if (ready) {
                         openGalleryOnPhone()
-                        hintText = "Opening gallery on the iPhone..."
                     } else {
                         hintText = "Connect the iPhone first"
                     }
                 }
-                Bubble("🎵", "Music", ready, 54.dp) {
+                Bubble("🎵", "Music", ready, 48.dp) {
                     if (ready) {
                         musicOpen = true
                     } else {
                         hintText = "Connect the iPhone first"
                     }
                 }
-                Bubble("❤", "Health", false, 54.dp) {
+            }
+            Spacer(modifier = Modifier.height(6.dp))
+            Row(horizontalArrangement = Arrangement.spacedBy(12.dp)) {
+                Bubble("❤", "Health", false, 48.dp) {
                     hintText = "Health is not built yet"
                 }
+                Bubble("👤", "Contacts", link.contactCount > 0, 48.dp) {
+                    contactsOpen = true
+                }
             }
-            Spacer(modifier = Modifier.height(8.dp))
+            Spacer(modifier = Modifier.height(6.dp))
             Text(
                 text = if (hintText.isNotEmpty()) hintText else if (ready) "Keep the iPhone app open" else "Not connected",
                 fontSize = 10.sp,
                 color = Color(0xFFAAAAAA),
                 textAlign = TextAlign.Center
             )
+        }
+    }
+
+    @Composable
+    private fun SettingsPage() {
+        ScalingLazyColumn(
+            modifier = Modifier.fillMaxSize(),
+            horizontalAlignment = Alignment.CenterHorizontally
+        ) {
+            item { Text(text = "Settings") }
+            item {
+                Button(
+                    onClick = { link.cycleHapticsLevel() },
+                    modifier = Modifier.fillMaxWidth(),
+                    label = { Text(text = "Haptics level", maxLines = 1) },
+                    secondaryLabel = {
+                        Text(text = hapticNames[link.hapticsLevel.coerceIn(0, 2)])
+                    }
+                )
+            }
+            item {
+                Button(
+                    onClick = {
+                        if (link.hapticsOn) {
+                            link.changeHapticsOn(false)
+                        } else if (hasMic()) {
+                            link.changeHapticsOn(true)
+                        } else {
+                            micLauncher.launch(Manifest.permission.RECORD_AUDIO)
+                        }
+                    },
+                    modifier = Modifier.fillMaxWidth(),
+                    label = { Text(text = "Music haptics", maxLines = 1) },
+                    secondaryLabel = { Text(text = if (link.hapticsOn) "On (uses mic)" else "Off") }
+                )
+            }
+            item {
+                Button(
+                    onClick = { link.changeRingOnWatch(!link.ringOnWatch) },
+                    modifier = Modifier.fillMaxWidth(),
+                    label = { Text(text = "Ring on watch", maxLines = 1) },
+                    secondaryLabel = { Text(text = if (link.ringOnWatch) "On" else "Off") }
+                )
+            }
+            item {
+                Button(
+                    onClick = { link.changeBezelCalls(!link.bezelCalls) },
+                    modifier = Modifier.fillMaxWidth(),
+                    label = { Text(text = "Bezel answers calls", maxLines = 1) },
+                    secondaryLabel = { Text(text = if (link.bezelCalls) "On" else "Off") }
+                )
+            }
+            item {
+                Text(
+                    text = "Haptics need the watch to hear the music (speaker).",
+                    fontSize = 9.sp,
+                    color = Color(0xFF9E9E9E),
+                    textAlign = TextAlign.Center,
+                    modifier = Modifier.padding(horizontal = 16.dp)
+                )
+            }
+        }
+    }
+
+    // ---------- Calls ----------
+
+    @Composable
+    private fun CallScreen() {
+        val focusRequester = remember { FocusRequester() }
+        var acc by remember { mutableFloatStateOf(0f) }
+        val shownAt = remember(link.callTick) { SystemClock.uptimeMillis() }
+        var done by remember(link.callTick) { mutableStateOf(false) }
+        val canAnswer = link.callPositive.isNotEmpty()
+        val canDecline = link.callNegative.isNotEmpty()
+
+        LaunchedEffect(Unit) {
+            focusRequester.requestFocus()
+        }
+
+        Box(
+            modifier = Modifier
+                .fillMaxSize()
+                .background(Brush.verticalGradient(listOf(Color(0xFF1B3A2B), Color(0xFF141416))))
+                .onRotaryScrollEvent { event ->
+                    if (!link.bezelCalls || done || SystemClock.uptimeMillis() - shownAt < 800L) {
+                        return@onRotaryScrollEvent true
+                    }
+                    acc += event.verticalScrollPixels
+                    if (acc >= 24f && canAnswer) {
+                        done = true
+                        acc = 0f
+                        link.answerCall()
+                    } else if (acc <= -24f && canDecline) {
+                        done = true
+                        acc = 0f
+                        link.declineCall()
+                    } else if (abs(acc) > 60f) {
+                        acc = 0f
+                    }
+                    true
+                }
+                .focusRequester(focusRequester)
+                .focusable()
+        ) {
+            Column(
+                modifier = Modifier
+                    .fillMaxSize()
+                    .padding(horizontal = 28.dp),
+                horizontalAlignment = Alignment.CenterHorizontally,
+                verticalArrangement = Arrangement.Center
+            ) {
+                Text(text = "Incoming call", fontSize = 11.sp, color = Color(0xFFA5D6A7))
+                Spacer(modifier = Modifier.height(2.dp))
+                Text(
+                    text = link.callName,
+                    fontSize = 20.sp,
+                    maxLines = 2,
+                    overflow = TextOverflow.Ellipsis,
+                    textAlign = TextAlign.Center
+                )
+                if (link.callDetail.isNotEmpty()) {
+                    Text(
+                        text = link.callDetail,
+                        fontSize = 10.sp,
+                        color = Color(0xFFBBBBBB),
+                        maxLines = 1,
+                        overflow = TextOverflow.Ellipsis,
+                        textAlign = TextAlign.Center
+                    )
+                }
+                Spacer(modifier = Modifier.height(10.dp))
+                Row(horizontalArrangement = Arrangement.spacedBy(22.dp)) {
+                    if (canDecline) {
+                        Column(horizontalAlignment = Alignment.CenterHorizontally) {
+                            Box(
+                                modifier = Modifier
+                                    .size(46.dp)
+                                    .clip(CircleShape)
+                                    .background(Color(0xFFC62828))
+                                    .clickable {
+                                        done = true
+                                        link.declineCall()
+                                    },
+                                contentAlignment = Alignment.Center
+                            ) {
+                                Text(text = "✕", fontSize = 20.sp)
+                            }
+                            Text(text = link.callNegative, fontSize = 9.sp, color = Color(0xFFEF9A9A), maxLines = 1)
+                        }
+                    }
+                    if (canAnswer) {
+                        Column(horizontalAlignment = Alignment.CenterHorizontally) {
+                            Box(
+                                modifier = Modifier
+                                    .size(46.dp)
+                                    .clip(CircleShape)
+                                    .background(Color(0xFF2E7D32))
+                                    .clickable {
+                                        done = true
+                                        link.answerCall()
+                                    },
+                                contentAlignment = Alignment.Center
+                            ) {
+                                Text(text = "✓", fontSize = 20.sp)
+                            }
+                            Text(text = link.callPositive, fontSize = 9.sp, color = Color(0xFFA5D6A7), maxLines = 1)
+                        }
+                    }
+                }
+                Spacer(modifier = Modifier.height(6.dp))
+                if (link.bezelCalls) {
+                    Text(
+                        text = "bezel right = ${if (canAnswer) link.callPositive else "-"}   left = ${if (canDecline) link.callNegative else "-"}",
+                        fontSize = 8.sp,
+                        color = Color(0xFF8A8A8E),
+                        textAlign = TextAlign.Center
+                    )
+                }
+            }
+            Box(
+                modifier = Modifier
+                    .align(Alignment.BottomStart)
+                    .padding(start = 38.dp, bottom = 30.dp)
+                    .size(30.dp)
+                    .clip(CircleShape)
+                    .background(if (link.ringOnWatch) Color(0xFF244B2F) else Color(0xFF3C3C40))
+                    .border(1.5.dp, if (link.ringOnWatch) Color(0xFF4CAF50) else Color(0xFF58585E), CircleShape)
+                    .clickable { link.changeRingOnWatch(!link.ringOnWatch) },
+                contentAlignment = Alignment.Center
+            ) {
+                Text(text = if (link.ringOnWatch) "🔔" else "🔕", fontSize = 13.sp)
+            }
+        }
+    }
+
+    // ---------- Contacts ----------
+
+    @Composable
+    private fun ContactsScreen() {
+        @Suppress("UNUSED_VARIABLE")
+        val version = link.contactsVersion
+        val list = link.contactBook.entries
+        ScalingLazyColumn(
+            modifier = Modifier
+                .fillMaxSize()
+                .background(Color(0xFF2B2B2E)),
+            horizontalAlignment = Alignment.CenterHorizontally
+        ) {
+            item { Text(text = "Contacts (${list.size})") }
+            if (list.isEmpty()) {
+                item {
+                    Text(
+                        text = "No contacts yet.\nTurn on Contacts sync in the iPhone app.",
+                        fontSize = 11.sp,
+                        color = Color(0xFFBBBBBB),
+                        textAlign = TextAlign.Center,
+                        modifier = Modifier.padding(horizontal = 18.dp)
+                    )
+                }
+            } else {
+                items(list) { entry ->
+                    Button(
+                        onClick = { },
+                        modifier = Modifier.fillMaxWidth(),
+                        label = { Text(text = entry.name, maxLines = 1, overflow = TextOverflow.Ellipsis) },
+                        secondaryLabel = { Text(text = entry.number, maxLines = 1) }
+                    )
+                }
+            }
         }
     }
 
@@ -457,6 +774,35 @@ class MainActivity : ComponentActivity() {
                         drawRect(tint, Offset(w * 0.1f, h * 0.18f), Size(w * 0.16f, h * 0.64f))
                     }
                 }
+            }
+        }
+    }
+
+    @Composable
+    private fun HapticsButton(modifier: Modifier) {
+        Row(
+            modifier = modifier,
+            verticalAlignment = Alignment.CenterVertically,
+            horizontalArrangement = Arrangement.spacedBy(3.dp)
+        ) {
+            Box(
+                modifier = Modifier
+                    .size(28.dp)
+                    .clip(CircleShape)
+                    .background(if (link.hapticsOn) Color(0xFF244B2F) else Color(0xFF3C3C40))
+                    .border(1.5.dp, if (link.hapticsOn) Color(0xFF4CAF50) else Color(0xFF58585E), CircleShape)
+                    .clickable { toggleHaptics() },
+                contentAlignment = Alignment.Center
+            ) {
+                Text(text = "📳", fontSize = 13.sp)
+            }
+            if (link.hapticsOn) {
+                Text(text = "👂", fontSize = 12.sp)
+                Text(
+                    text = listOf("S", "M", "H")[link.hapticsLevel.coerceIn(0, 2)],
+                    fontSize = 9.sp,
+                    color = Color(0xFFA5D6A7)
+                )
             }
         }
     }
@@ -528,8 +874,8 @@ class MainActivity : ComponentActivity() {
             if (!hasTrack) {
                 val message = when {
                     link.connectedAddress == null -> "Not connected"
-                    !link.phoneMusic -> "Allow music access in the iPhone app"
-                    else -> "Nothing playing.\nStart a song in the Music app on the iPhone."
+                    !link.amsReady && !link.phoneMusic -> "Media link: " + link.amsStatus
+                    else -> "Nothing playing.\nStart a song in any music app on the iPhone."
                 }
                 Column(
                     horizontalAlignment = Alignment.CenterHorizontally,
@@ -617,6 +963,11 @@ class MainActivity : ComponentActivity() {
                     )
                 }
             }
+            HapticsButton(
+                Modifier
+                    .align(Alignment.BottomStart)
+                    .padding(start = 34.dp, bottom = 24.dp)
+            )
         }
     }
 

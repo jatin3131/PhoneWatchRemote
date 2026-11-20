@@ -29,6 +29,31 @@ final class BluetoothManager: NSObject, ObservableObject, CBCentralManagerDelega
     var onEvent: ((String) -> Void)?
     /// Called with each short message the watch sends (music).
     var onMusicEvent: ((String) -> Void)?
+    /// Called with each longer message the watch sends (type, payload).
+    var onFrame: ((UInt8, Data) -> Void)?
+    private var frameBuffer = Data()
+    private var frameTotal = 0
+    private var frameType: UInt8 = 0
+
+    private func handleFrame(_ raw: Data) {
+        guard let first = raw.first else { return }
+        let b = raw.startIndex
+        if first == 1 {
+            guard raw.count >= 6 else { return }
+            frameType = raw[b + 1]
+            frameTotal = (Int(raw[b + 2]) << 24) | (Int(raw[b + 3]) << 16) | (Int(raw[b + 4]) << 8) | Int(raw[b + 5])
+            frameBuffer = Data(raw.dropFirst(6))
+        } else if first == 2 {
+            frameBuffer.append(raw.dropFirst(1))
+        }
+        if frameTotal > 0 && frameBuffer.count >= frameTotal {
+            let payload = Data(frameBuffer.prefix(frameTotal))
+            let t = frameType
+            frameBuffer = Data()
+            frameTotal = 0
+            onFrame?(t, payload)
+        }
+    }
 
     private var central: CBCentralManager!
     private var connecting: CBPeripheral?
@@ -220,6 +245,10 @@ final class BluetoothManager: NSObject, ObservableObject, CBCentralManagerDelega
     }
 
     func peripheral(_ peripheral: CBPeripheral, didUpdateValueFor characteristic: CBCharacteristic, error: Error?) {
+        if characteristic.uuid == Self.eventUUID, let raw = characteristic.value, let lead = raw.first, lead == 1 || lead == 2 {
+            handleFrame(raw)
+            return
+        }
         if characteristic.uuid == Self.eventUUID,
            let data = characteristic.value,
            let text = String(data: data, encoding: .utf8) {

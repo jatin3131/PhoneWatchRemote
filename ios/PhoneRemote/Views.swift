@@ -33,6 +33,8 @@ struct RootView: View {
     @EnvironmentObject var remote: RemoteModel
     @EnvironmentObject var music: MusicManager
     @EnvironmentObject var settings: FeatureSettings
+    @EnvironmentObject var contacts: ContactsManager
+    @EnvironmentObject var artwork: ArtworkManager
     @State private var skipped = false
 
     var body: some View {
@@ -47,6 +49,8 @@ struct RootView: View {
         .onAppear {
             remote.attach(ble)
             music.attach(ble: ble, settings: settings)
+            contacts.attach(ble: ble, settings: settings)
+            artwork.attach(ble: ble)
         }
     }
 }
@@ -147,6 +151,7 @@ struct MainView: View {
     @EnvironmentObject var remote: RemoteModel
     @EnvironmentObject var music: MusicManager
     @StateObject private var library = PhotoLibrary()
+    @EnvironmentObject var contacts: ContactsManager
     let watchName: String
     @State private var showGallery = false
     @State private var showDenied = false
@@ -247,6 +252,12 @@ struct MainView: View {
         }
         .onChange(of: library.status) { _ in
             sendStatus()
+        }
+        .onChange(of: settings.isOn("contacts")) { _ in
+            contacts.syncIfAllowed()
+        }
+        .onChange(of: settings.isOn("calls")) { _ in
+            contacts.syncIfAllowed()
         }
         .onChange(of: music.authorized) { _ in
             sendStatus()

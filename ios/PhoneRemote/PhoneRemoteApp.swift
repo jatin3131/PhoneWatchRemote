@@ -6,6 +6,8 @@ struct PhoneRemoteApp: App {
     @StateObject private var settings = FeatureSettings()
     @StateObject private var remote = RemoteModel()
     @StateObject private var music = MusicManager()
+    @StateObject private var contacts = ContactsManager()
+    @StateObject private var artwork = ArtworkManager()
 
     var body: some Scene {
         WindowGroup {
@@ -14,6 +16,8 @@ struct PhoneRemoteApp: App {
                 .environmentObject(settings)
                 .environmentObject(remote)
                 .environmentObject(music)
+                .environmentObject(contacts)
+                .environmentObject(artwork)
         }
     }
 }
