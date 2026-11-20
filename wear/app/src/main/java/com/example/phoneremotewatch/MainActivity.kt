@@ -1,7 +1,9 @@
 package com.example.phoneremotewatch
 
 import android.Manifest
+import android.app.ActivityManager
 import android.content.Intent
+import android.provider.Settings
 import android.content.pm.PackageManager
 import android.os.Build
 import android.os.Bundle
@@ -166,6 +168,7 @@ class MainActivity : ComponentActivity() {
     }
 
     private fun startLink(restart: Boolean) {
+        link.markLinkEnabled(true)
         if (hasBlePermissions()) {
             try {
                 ContextCompat.startForegroundService(
@@ -182,6 +185,7 @@ class MainActivity : ComponentActivity() {
     }
 
     private fun stopLink() {
+        link.markLinkEnabled(false)
         try {
             startService(Intent(this, LinkService::class.java).setAction(LinkService.ACTION_STOP))
         } catch (e: Exception) {
@@ -236,6 +240,50 @@ class MainActivity : ComponentActivity() {
             }
         }
         startLink(false)
+    }
+
+    override fun onResume() {
+        super.onResume()
+        permissionVersion += 1
+    }
+
+    private fun resetApp() {
+        link.markLinkEnabled(true)
+        try {
+            startService(Intent(this, LinkService::class.java).setAction(LinkService.ACTION_STOP))
+        } catch (e: Exception) {
+            link.stop()
+        }
+        handler.postDelayed({
+            try {
+                getSystemService(ActivityManager::class.java).clearApplicationUserData()
+            } catch (e: Exception) {
+                hintText = "Reset failed: ${e.message}"
+            }
+        }, 800L)
+    }
+
+    @Composable
+    private fun ResetButton() {
+        var armed by remember { mutableStateOf(false) }
+        LaunchedEffect(armed) {
+            if (armed) {
+                delay(4000)
+                armed = false
+            }
+        }
+        Button(
+            onClick = {
+                if (armed) {
+                    resetApp()
+                } else {
+                    armed = true
+                }
+            },
+            modifier = Modifier.fillMaxWidth(),
+            label = { Text(text = if (armed) "Tap again to erase" else "Reset app data", maxLines = 1) },
+            secondaryLabel = { Text(text = if (armed) "cannot be undone" else "like a fresh install", maxLines = 1) }
+        )
     }
 
     override fun onDestroy() {
@@ -374,11 +422,11 @@ class MainActivity : ComponentActivity() {
             verticalArrangement = Arrangement.Center
         ) {
             Text(
-                text = if (connected) "iPhone connected" else "Not connected",
+                text = if (!link.btOn) "Bluetooth is off" else if (connected) "iPhone connected" else "Not connected",
                 fontSize = 14.sp
             )
             Text(
-                text = (if (connected) (if (link.dataReady) "data link ready" else "data link not ready") else link.status) + "  |  watch v7",
+                text = (if (connected) (if (link.dataReady) "data link ready" else "data link not ready") else link.status) + "  |  watch v8",
                 fontSize = 9.sp,
                 color = Color(0xFFAAAAAA),
                 textAlign = TextAlign.Center,
@@ -386,7 +434,18 @@ class MainActivity : ComponentActivity() {
             )
             Spacer(modifier = Modifier.height(6.dp))
             Row(horizontalArrangement = Arrangement.spacedBy(5.dp)) {
-                Bubble("🔵", "Bluetooth", hasBlePermissions(), 36.dp) { startLink(false) }
+                Bubble("🔵", "Bluetooth", hasBlePermissions() && link.btOn, 36.dp) {
+                    if (!link.btOn) {
+                        try {
+                            startActivity(Intent(Settings.ACTION_BLUETOOTH_SETTINGS))
+                        } catch (e: Exception) {
+                            hintText = "Open Bluetooth in the watch settings"
+                        }
+                    } else {
+                        startLink(false)
+                        hintText = "Beacon: " + link.solicitStatus
+                    }
+                }
                 Bubble("🔔", "Alerts", hasNotificationPermission(), 36.dp) { requestNotifications() }
                 Bubble("🎵", "Music", link.phoneMusic || link.amsReady, 36.dp) {
                     hintText = "Music: " + link.amsStatus
@@ -412,7 +471,7 @@ class MainActivity : ComponentActivity() {
             }
             Spacer(modifier = Modifier.height(4.dp))
             Text(
-                text = if (hintText.isNotEmpty()) hintText else "tap a bubble for details",
+                text = if (hintText.isNotEmpty()) hintText else if (!link.btOn) "Tap the Bluetooth bubble to open settings" else "tap a bubble for details",
                 fontSize = 9.sp,
                 color = Color(0xFFB0BEC5),
                 textAlign = TextAlign.Center,
@@ -443,7 +502,7 @@ class MainActivity : ComponentActivity() {
 
     @Composable
     private fun MenuPage() {
-        val ready = link.dataReady && link.connectedAddress != null
+        val ready = link.connectedAddress != null
         LaunchedEffect(hintText) {
             if (hintText.isNotEmpty()) {
                 delay(2500)
@@ -551,6 +610,9 @@ class MainActivity : ComponentActivity() {
                     textAlign = TextAlign.Center,
                     modifier = Modifier.padding(horizontal = 16.dp)
                 )
+            }
+            item {
+                ResetButton()
             }
         }
     }

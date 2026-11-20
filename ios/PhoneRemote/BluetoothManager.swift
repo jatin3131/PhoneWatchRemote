@@ -14,72 +14,154 @@ final class BluetoothManager: NSObject, ObservableObject, CBCentralManagerDelega
     static let watchServiceUUID = CBUUID(string: "6E5A0001-B5A3-F393-E0A9-E50E24DCCA9E")
     static let eventUUID = CBUUID(string: "6E5A0002-B5A3-F393-E0A9-E50E24DCCA9E")
     static let stateUUID = CBUUID(string: "6E5A0003-B5A3-F393-E0A9-E50E24DCCA9E")
+    static let restoreID = "phoneremote.central"
 
-    /// Test build: list every named Bluetooth device. Later this becomes false so only our watch shows.
-    static let scanAllDevices = true
-
+    /// When true, the list shows every named Bluetooth device. Otherwise only watches running our app.
+    @Published var scanAll = false
     @Published var state: CBManagerState = .unknown
     @Published var devices: [FoundDevice] = []
     @Published var isScanning = false
     @Published var connectedName: String? = nil
     @Published var statusText = ""
     @Published var linkReady = false
+    @Published var savedName: String
+    @Published var hasSavedWatch: Bool
+    @Published var autoConnect: Bool
 
     /// Called with each short message the watch sends (gallery and editor).
     var onEvent: ((String) -> Void)?
     /// Called with each short message the watch sends (music).
     var onMusicEvent: ((String) -> Void)?
+    /// Called with each short message the watch sends (contacts).
+    var onContactsEvent: ((String) -> Void)?
     /// Called with each longer message the watch sends (type, payload).
     var onFrame: ((UInt8, Data) -> Void)?
+
     private var frameBuffer = Data()
     private var frameTotal = 0
     private var frameType: UInt8 = 0
-
-    private func handleFrame(_ raw: Data) {
-        guard let first = raw.first else { return }
-        let b = raw.startIndex
-        if first == 1 {
-            guard raw.count >= 6 else { return }
-            frameType = raw[b + 1]
-            frameTotal = (Int(raw[b + 2]) << 24) | (Int(raw[b + 3]) << 16) | (Int(raw[b + 4]) << 8) | Int(raw[b + 5])
-            frameBuffer = Data(raw.dropFirst(6))
-        } else if first == 2 {
-            frameBuffer.append(raw.dropFirst(1))
-        }
-        if frameTotal > 0 && frameBuffer.count >= frameTotal {
-            let payload = Data(frameBuffer.prefix(frameTotal))
-            let t = frameType
-            frameBuffer = Data()
-            frameTotal = 0
-            onFrame?(t, payload)
-        }
-    }
 
     private var central: CBCentralManager!
     private var connecting: CBPeripheral?
     private var eventChar: CBCharacteristic?
     private var stateChar: CBCharacteristic?
     private var scanToken = 0
+    private var scanningForSaved = false
     private var writeQueue: [Data] = []
     private var writing = false
 
     override init() {
+        let d = UserDefaults.standard
+        savedName = d.string(forKey: "saved_watch_name") ?? "your watch"
+        hasSavedWatch = d.string(forKey: "saved_watch_id") != nil
+        autoConnect = (d.object(forKey: "auto_connect") as? Bool) ?? true
         super.init()
         central = CBCentralManager(
             delegate: self,
             queue: nil,
-            options: [CBCentralManagerOptionShowPowerAlertKey: true]
+            options: [
+                CBCentralManagerOptionShowPowerAlertKey: true,
+                CBCentralManagerOptionRestoreIdentifierKey: Self.restoreID
+            ]
         )
     }
 
+    // MARK: - Remembered watch
+
+    private var savedID: UUID? {
+        guard let s = UserDefaults.standard.string(forKey: "saved_watch_id") else { return nil }
+        return UUID(uuidString: s)
+    }
+
+    private func rememberWatch(_ p: CBPeripheral, name: String) {
+        let d = UserDefaults.standard
+        d.set(p.identifier.uuidString, forKey: "saved_watch_id")
+        d.set(name, forKey: "saved_watch_name")
+        d.set(true, forKey: "auto_connect")
+        savedName = name
+        hasSavedWatch = true
+        autoConnect = true
+    }
+
+    /// Connects to the remembered watch and keeps trying until it is nearby.
+    func attemptReconnect() {
+        guard central.state == .poweredOn, autoConnect, let id = savedID else { return }
+        if connectedName != nil { return }
+        statusText = "Looking for \(savedName)..."
+        if let p = central.retrievePeripherals(withIdentifiers: [id]).first {
+            scanningForSaved = false
+            connecting = p
+            p.delegate = self
+            if p.state == .connected {
+                adopt(p)
+            } else {
+                central.connect(p, options: nil)
+            }
+        } else {
+            scanningForSaved = true
+            central.scanForPeripherals(withServices: [Self.watchServiceUUID], options: nil)
+        }
+    }
+
+    private func adopt(_ p: CBPeripheral) {
+        connecting = p
+        p.delegate = self
+        let name = p.name ?? savedName
+        rememberWatch(p, name: name)
+        connectedName = name
+        statusText = ""
+        p.discoverServices([Self.watchServiceUUID])
+    }
+
+    func reconnectSaved() {
+        UserDefaults.standard.set(true, forKey: "auto_connect")
+        autoConnect = true
+        attemptReconnect()
+    }
+
+    /// The only way to disconnect: stops auto-connecting until you tap Reconnect.
+    func userDisconnect() {
+        UserDefaults.standard.set(false, forKey: "auto_connect")
+        autoConnect = false
+        scanningForSaved = false
+        if let p = connecting {
+            central.cancelPeripheralConnection(p)
+        }
+        connectedName = nil
+        clearLink()
+        statusText = "Disconnected. Tap Reconnect to connect again."
+    }
+
+    func forgetWatch() {
+        scanningForSaved = false
+        if let p = connecting {
+            central.cancelPeripheralConnection(p)
+        }
+        connecting = nil
+        let d = UserDefaults.standard
+        d.removeObject(forKey: "saved_watch_id")
+        d.removeObject(forKey: "saved_watch_name")
+        d.set(true, forKey: "auto_connect")
+        hasSavedWatch = false
+        savedName = "your watch"
+        autoConnect = true
+        connectedName = nil
+        clearLink()
+        statusText = ""
+    }
+
+    // MARK: - Scanning (first time only)
+
     func startScan() {
         guard central.state == .poweredOn else { return }
+        scanningForSaved = false
+        central.stopScan()
         devices.removeAll()
         statusText = ""
         isScanning = true
         scanToken += 1
         let token = scanToken
-        let services: [CBUUID]? = Self.scanAllDevices ? nil : [Self.watchServiceUUID]
+        let services: [CBUUID]? = scanAll ? nil : [Self.watchServiceUUID]
         central.scanForPeripherals(withServices: services, options: nil)
         DispatchQueue.main.asyncAfter(deadline: .now() + 15) { [weak self] in
             guard let self = self, self.scanToken == token else { return }
@@ -100,14 +182,6 @@ final class BluetoothManager: NSObject, ObservableObject, CBCentralManagerDelega
         device.peripheral.delegate = self
         statusText = "Connecting to \(device.name)..."
         central.connect(device.peripheral, options: nil)
-    }
-
-    func disconnect() {
-        if let p = connecting {
-            central.cancelPeripheralConnection(p)
-        }
-        connectedName = nil
-        linkReady = false
     }
 
     // MARK: - Sending to the watch (one write at a time, in order)
@@ -162,23 +236,53 @@ final class BluetoothManager: NSObject, ObservableObject, CBCentralManagerDelega
         linkReady = false
         writeQueue.removeAll()
         writing = false
+        frameBuffer = Data()
+        frameTotal = 0
+    }
+
+    private func handleFrame(_ raw: Data) {
+        guard let first = raw.first else { return }
+        let b = raw.startIndex
+        if first == 1 {
+            guard raw.count >= 6 else { return }
+            frameType = raw[b + 1]
+            frameTotal = (Int(raw[b + 2]) << 24) | (Int(raw[b + 3]) << 16) | (Int(raw[b + 4]) << 8) | Int(raw[b + 5])
+            frameBuffer = Data(raw.dropFirst(6))
+        } else if first == 2 {
+            frameBuffer.append(raw.dropFirst(1))
+        }
+        if frameTotal > 0 && frameBuffer.count >= frameTotal {
+            let payload = Data(frameBuffer.prefix(frameTotal))
+            let t = frameType
+            frameBuffer = Data()
+            frameTotal = 0
+            onFrame?(t, payload)
+        }
     }
 
     // MARK: - CBCentralManagerDelegate
 
+    func centralManager(_ central: CBCentralManager, willRestoreState dict: [String: Any]) {
+        if let list = dict[CBCentralManagerRestoredStatePeripheralsKey] as? [CBPeripheral], let p = list.first {
+            connecting = p
+            p.delegate = self
+            if p.state == .connected {
+                connectedName = p.name ?? savedName
+                p.discoverServices([Self.watchServiceUUID])
+            }
+        }
+    }
+
     func centralManagerDidUpdateState(_ central: CBCentralManager) {
         state = central.state
         if central.state == .poweredOn {
-            let existing = central.retrieveConnectedPeripherals(withServices: [Self.watchServiceUUID])
-            if let p = existing.first {
-                connecting = p
-                p.delegate = self
-                central.connect(p, options: nil)
-            }
+            attemptReconnect()
         } else {
             isScanning = false
+            scanningForSaved = false
             connectedName = nil
             clearLink()
+            statusText = ""
         }
     }
 
@@ -188,8 +292,16 @@ final class BluetoothManager: NSObject, ObservableObject, CBCentralManagerDelega
         advertisementData: [String: Any],
         rssi RSSI: NSNumber
     ) {
+        if scanningForSaved {
+            scanningForSaved = false
+            central.stopScan()
+            connecting = peripheral
+            peripheral.delegate = self
+            central.connect(peripheral, options: nil)
+            return
+        }
         let name = peripheral.name ?? (advertisementData[CBAdvertisementDataLocalNameKey] as? String)
-        if Self.scanAllDevices && name == nil { return }
+        if scanAll && name == nil { return }
         let label = name ?? "Watch"
         let value = RSSI.intValue
         if let index = devices.firstIndex(where: { $0.id == peripheral.identifier }) {
@@ -201,19 +313,25 @@ final class BluetoothManager: NSObject, ObservableObject, CBCentralManagerDelega
     }
 
     func centralManager(_ central: CBCentralManager, didConnect peripheral: CBPeripheral) {
-        connectedName = peripheral.name ?? "Watch"
-        statusText = ""
-        peripheral.delegate = self
-        peripheral.discoverServices([Self.watchServiceUUID])
+        adopt(peripheral)
     }
 
     func centralManager(_ central: CBCentralManager, didFailToConnect peripheral: CBPeripheral, error: Error?) {
-        statusText = "Could not connect. Try again."
+        statusText = "Could not connect. Retrying..."
+        if autoConnect {
+            DispatchQueue.main.asyncAfter(deadline: .now() + 3) { [weak self] in
+                self?.attemptReconnect()
+            }
+        }
     }
 
     func centralManager(_ central: CBCentralManager, didDisconnectPeripheral peripheral: CBPeripheral, error: Error?) {
         connectedName = nil
         clearLink()
+        if autoConnect, central.state == .poweredOn, peripheral.identifier == savedID {
+            statusText = "Reconnecting to \(savedName)..."
+            central.connect(peripheral, options: nil)
+        }
     }
 
     // MARK: - CBPeripheralDelegate
@@ -254,6 +372,7 @@ final class BluetoothManager: NSObject, ObservableObject, CBCentralManagerDelega
            let text = String(data: data, encoding: .utf8) {
             onEvent?(text)
             onMusicEvent?(text)
+            onContactsEvent?(text)
         }
     }
 }

@@ -61,11 +61,22 @@ struct ConnectView: View {
 
     private var message: String {
         switch ble.state {
-        case .poweredOn: return "Bluetooth is on. Scan to find your watch."
-        case .poweredOff: return "Bluetooth is off. Turn it on, then come back to this app."
-        case .unauthorized: return "Bluetooth access is blocked for this app. Allow it in Settings."
-        case .unsupported: return "This iPhone does not support Bluetooth."
-        default: return "Checking Bluetooth..."
+        case .poweredOn:
+            if ble.hasSavedWatch && ble.autoConnect {
+                return "Looking for \(ble.savedName). It connects by itself when the watch is nearby."
+            }
+            if ble.hasSavedWatch {
+                return "Disconnected from \(ble.savedName). Tap Reconnect to connect again."
+            }
+            return "Bluetooth is on. Scan to find your watch."
+        case .poweredOff:
+            return "Bluetooth is off. Turn it on, then come back to this app."
+        case .unauthorized:
+            return "Bluetooth access is blocked for this app. Allow it in Settings."
+        case .unsupported:
+            return "This iPhone does not support Bluetooth."
+        default:
+            return "Checking Bluetooth..."
         }
     }
 
@@ -91,7 +102,15 @@ struct ConnectView: View {
                     .padding(.horizontal, 24)
                 }
 
-                Button(ble.isScanning ? "Scanning..." : "Scan for watches") {
+                if ble.state == .poweredOn && ble.hasSavedWatch && !ble.autoConnect {
+                    Button("Reconnect to \(ble.savedName)") {
+                        ble.reconnectSaved()
+                    }
+                    .buttonStyle(PrimaryButtonStyle())
+                    .padding(.horizontal, 24)
+                }
+
+                Button(ble.isScanning ? "Scanning..." : (ble.hasSavedWatch ? "Scan for a different watch" : "Scan for watches")) {
                     ble.startScan()
                 }
                 .buttonStyle(PrimaryButtonStyle())
@@ -102,6 +121,8 @@ struct ConnectView: View {
                     Text(ble.statusText)
                         .font(.system(size: 14))
                         .foregroundColor(.gray)
+                        .multilineTextAlignment(.center)
+                        .padding(.horizontal, 30)
                 }
 
                 ScrollView {
@@ -129,6 +150,20 @@ struct ConnectView: View {
                     .padding(.horizontal, 24)
                 }
 
+                Button(ble.scanAll ? "Only show my watch" : "Can't see your watch? Show all Bluetooth devices") {
+                    ble.scanAll.toggle()
+                }
+                .font(.system(size: 13))
+                .foregroundColor(.gray)
+
+                if ble.hasSavedWatch {
+                    Button("Forget this watch") {
+                        ble.forgetWatch()
+                    }
+                    .font(.system(size: 13))
+                    .foregroundColor(.gray)
+                }
+
                 Button("Skip for now (testing)") {
                     onSkip()
                 }
@@ -153,6 +188,7 @@ struct MainView: View {
     @StateObject private var library = PhotoLibrary()
     @EnvironmentObject var contacts: ContactsManager
     let watchName: String
+    @Environment(\.scenePhase) private var scenePhase
     @State private var showGallery = false
     @State private var showDenied = false
 
@@ -190,7 +226,18 @@ struct MainView: View {
                             .font(.system(size: 15))
                             .foregroundColor(.gray)
                         Spacer()
-                        Text((ble.linkReady ? "data link ready" : "data link not ready") + "  |  build " + appBuildNumber)
+                        VStack(alignment: .trailing, spacing: 4) {
+                            Button("Disconnect") {
+                                ble.userDisconnect()
+                            }
+                            .font(.system(size: 13, weight: .semibold))
+                            .foregroundColor(.white)
+                            .padding(.horizontal, 12)
+                            .padding(.vertical, 6)
+                            .background(Color.black)
+                            .cornerRadius(10)
+                            Text((ble.linkReady ? "data link ready" : "data link not ready") + "  |  build " + appBuildNumber)
+                        }
                             .font(.system(size: 12))
                             .foregroundColor(.gray)
                     }
@@ -258,6 +305,13 @@ struct MainView: View {
         }
         .onChange(of: settings.isOn("calls")) { _ in
             contacts.syncIfAllowed()
+        }
+        .onChange(of: scenePhase) { phase in
+            if phase == .active {
+                library.status = PHPhotoLibrary.authorizationStatus(for: .readWrite)
+                music.updateAuthorization()
+                sendStatus()
+            }
         }
         .onChange(of: music.authorized) { _ in
             sendStatus()

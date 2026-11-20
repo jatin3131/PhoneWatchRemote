@@ -63,6 +63,8 @@ class BleLink(private val context: Context) {
     private val prefs = context.getSharedPreferences("watch_settings", Context.MODE_PRIVATE)
 
     var status by mutableStateOf("Not started")
+    var btOn by mutableStateOf(true)
+    var solicitStatus by mutableStateOf("not started")
     var connectedAddress by mutableStateOf<String?>(null)
     var advertising by mutableStateOf(false)
     var connectCount by mutableIntStateOf(0)
@@ -114,6 +116,7 @@ class BleLink(private val context: Context) {
     private var advertiser: BluetoothLeAdvertiser? = null
     private var eventChar: BluetoothGattCharacteristic? = null
     private var subscribedDevice: BluetoothDevice? = null
+    private var solicitCb: AdvertiseCallback? = null
 
     private var asmActive = false
     private var asmType = 0
@@ -134,6 +137,7 @@ class BleLink(private val context: Context) {
     private var busy = false
     private var amsRetries = 0
     private var receiverRegistered = false
+    private var contactsRequested = false
 
     private val notifyQueue = ArrayDeque<ByteArray>()
     private var notifyBusy = false
@@ -154,6 +158,10 @@ class BleLink(private val context: Context) {
     }
 
     // ---------- Saved settings ----------
+
+    fun markLinkEnabled(value: Boolean) {
+        prefs.edit().putBoolean("link_enabled", value).apply()
+    }
 
     fun changeHapticsOn(value: Boolean) {
         hapticsOn = value
@@ -200,12 +208,14 @@ class BleLink(private val context: Context) {
         changed()
     }
 
+    // ---------- Advertising ----------
+
     private val advertiseCallback = object : AdvertiseCallback() {
         override fun onStartSuccess(settingsInEffect: AdvertiseSettings?) {
             main.post {
                 advertising = true
                 if (connectedAddress == null) {
-                    status = "Waiting for the iPhone. Scan on the iPhone and tap this watch."
+                    status = "Waiting for the iPhone. It connects by itself when nearby."
                     changed()
                 }
             }
@@ -217,6 +227,109 @@ class BleLink(private val context: Context) {
                 status = "Advertising failed (code $errorCode)"
             }
         }
+    }
+
+    private fun stopSolicitation() {
+        val cb = solicitCb ?: return
+        try {
+            advertiser?.stopAdvertising(cb)
+        } catch (e: Exception) {
+            // Ignore.
+        }
+        solicitCb = null
+    }
+
+    /** A second, tiny advertisement that asks the iPhone itself to reconnect (works without the iPhone app). */
+    private fun startSolicitation() {
+        if (Build.VERSION.SDK_INT < 31) {
+            solicitStatus = "needs Wear OS 3+"
+            return
+        }
+        val adv = advertiser ?: return
+        stopSolicitation()
+        val cb = object : AdvertiseCallback() {
+            override fun onStartSuccess(settingsInEffect: AdvertiseSettings?) {
+                main.post { solicitStatus = "on" }
+            }
+
+            override fun onStartFailure(errorCode: Int) {
+                main.post { solicitStatus = "not available (code $errorCode)" }
+            }
+        }
+        solicitCb = cb
+        try {
+            val settings = AdvertiseSettings.Builder()
+                .setAdvertiseMode(AdvertiseSettings.ADVERTISE_MODE_BALANCED)
+                .setTxPowerLevel(AdvertiseSettings.ADVERTISE_TX_POWER_MEDIUM)
+                .setConnectable(true)
+                .setTimeout(0)
+                .build()
+            val data = AdvertiseData.Builder()
+                .setIncludeDeviceName(false)
+                .addServiceSolicitationUuid(ParcelUuid(ANCS_SERVICE))
+                .build()
+            adv.startAdvertising(settings, data, cb)
+        } catch (e: Exception) {
+            solicitStatus = "not available (${e.message})"
+        }
+    }
+
+    private fun startAdvertising() {
+        val adv = advertiser ?: return
+        try {
+            adv.stopAdvertising(advertiseCallback)
+        } catch (e: Exception) {
+            // Nothing to stop.
+        }
+        val settings = AdvertiseSettings.Builder()
+            .setAdvertiseMode(AdvertiseSettings.ADVERTISE_MODE_LOW_LATENCY)
+            .setTxPowerLevel(AdvertiseSettings.ADVERTISE_TX_POWER_HIGH)
+            .setConnectable(true)
+            .setTimeout(0)
+            .build()
+        val data = AdvertiseData.Builder()
+            .setIncludeDeviceName(false)
+            .addServiceUuid(ParcelUuid(SERVICE_UUID))
+            .build()
+        val scanResponse = AdvertiseData.Builder()
+            .setIncludeDeviceName(true)
+            .build()
+        adv.startAdvertising(settings, data, scanResponse, advertiseCallback)
+        startSolicitation()
+    }
+
+    private val heartbeat = object : Runnable {
+        override fun run() {
+            if (!running) return
+            if (connectedAddress == null && btOn) {
+                startAdvertising()
+            }
+            main.postDelayed(this, 30000L)
+        }
+    }
+
+    // ---------- Connection from the iPhone ----------
+
+    private fun onPhoneDisconnected() {
+        connectedAddress = null
+        subscribedDevice = null
+        dataReady = false
+        mode = WatchMode.IDLE
+        phoneGallery = false
+        phoneMusic = false
+        notifyQueue.clear()
+        notifyBusy = false
+        contactsRequested = false
+        stopAmsClient()
+        phoneDevice = null
+        amsStatus = "iPhone disconnected"
+        ancsStatus = "iPhone disconnected"
+        clearMusic()
+        callActive = false
+        callUid = -1L
+        status = "iPhone disconnected. Waiting again..."
+        changed()
+        startAdvertising()
     }
 
     private val serverCallback = object : BluetoothGattServerCallback() {
@@ -233,24 +346,7 @@ class BleLink(private val context: Context) {
                     changed()
                     main.postDelayed({ startAms() }, 2500L)
                 } else if (newState == BluetoothProfile.STATE_DISCONNECTED) {
-                    connectedAddress = null
-                    subscribedDevice = null
-                    dataReady = false
-                    mode = WatchMode.IDLE
-                    phoneGallery = false
-                    phoneMusic = false
-                    notifyQueue.clear()
-                    notifyBusy = false
-                    stopAmsClient()
-                    phoneDevice = null
-                    amsStatus = "iPhone disconnected"
-                    ancsStatus = "iPhone disconnected"
-                    clearMusic()
-                    callActive = false
-                    callUid = -1L
-                    status = "iPhone disconnected. Waiting again..."
-                    changed()
-                    startAdvertising()
+                    onPhoneDisconnected()
                 }
             }
         }
@@ -433,6 +529,10 @@ class BleLink(private val context: Context) {
                 shareContacts = contactsOn
                 if (!shareCalls && callActive) {
                     clearCall()
+                }
+                if (shareContacts && contactCount == 0 && !contactsRequested) {
+                    contactsRequested = true
+                    sendEvent("CR")
                 }
             }
         }
@@ -949,6 +1049,27 @@ class BleLink(private val context: Context) {
 
     // ---------- Starting and stopping ----------
 
+    /** Called by the service when Bluetooth is switched on or off. */
+    fun onBluetoothState(on: Boolean) {
+        if (on) {
+            btOn = true
+            if (prefs.getBoolean("link_enabled", true) && !running) {
+                try {
+                    start()
+                } catch (e: Exception) {
+                    status = "Could not start: ${e.message}"
+                }
+            }
+        } else {
+            stop()
+            btOn = false
+            status = "Bluetooth is off"
+            amsStatus = "Bluetooth is off"
+            ancsStatus = "Bluetooth is off"
+            changed()
+        }
+    }
+
     fun start() {
         stop()
         if (!receiverRegistered) {
@@ -970,8 +1091,12 @@ class BleLink(private val context: Context) {
             status = "No Bluetooth on this watch"
             return
         }
-        if (!adapter.isEnabled) {
-            status = "Bluetooth is off. Turn it on in the watch settings, then press Restart."
+        btOn = adapter.isEnabled
+        if (!btOn) {
+            status = "Bluetooth is off"
+            amsStatus = "Bluetooth is off"
+            ancsStatus = "Bluetooth is off"
+            changed()
             return
         }
         val adv = adapter.bluetoothLeAdvertiser
@@ -1010,29 +1135,8 @@ class BleLink(private val context: Context) {
         gattServer.addService(service)
         status = "Starting..."
         running = true
-    }
-
-    private fun startAdvertising() {
-        val adv = advertiser ?: return
-        try {
-            adv.stopAdvertising(advertiseCallback)
-        } catch (e: Exception) {
-            // Nothing to stop.
-        }
-        val settings = AdvertiseSettings.Builder()
-            .setAdvertiseMode(AdvertiseSettings.ADVERTISE_MODE_LOW_LATENCY)
-            .setTxPowerLevel(AdvertiseSettings.ADVERTISE_TX_POWER_HIGH)
-            .setConnectable(true)
-            .setTimeout(0)
-            .build()
-        val data = AdvertiseData.Builder()
-            .setIncludeDeviceName(false)
-            .addServiceUuid(ParcelUuid(SERVICE_UUID))
-            .build()
-        val scanResponse = AdvertiseData.Builder()
-            .setIncludeDeviceName(true)
-            .build()
-        adv.startAdvertising(settings, data, scanResponse, advertiseCallback)
+        main.removeCallbacks(heartbeat)
+        main.postDelayed(heartbeat, 30000L)
     }
 
     /** Sends a short message to the iPhone app. Music commands go to the iPhone's media service when it is ready. */
@@ -1056,6 +1160,7 @@ class BleLink(private val context: Context) {
     }
 
     fun stop() {
+        main.removeCallbacks(heartbeat)
         stopAmsClient()
         if (receiverRegistered) {
             try {
@@ -1065,6 +1170,7 @@ class BleLink(private val context: Context) {
             }
             receiverRegistered = false
         }
+        stopSolicitation()
         try {
             advertiser?.stopAdvertising(advertiseCallback)
         } catch (e: Exception) {
@@ -1082,6 +1188,7 @@ class BleLink(private val context: Context) {
         phoneDevice = null
         notifyQueue.clear()
         notifyBusy = false
+        contactsRequested = false
         advertising = false
         connectedAddress = null
         dataReady = false
@@ -1090,6 +1197,7 @@ class BleLink(private val context: Context) {
         phoneMusic = false
         amsStatus = "not started"
         ancsStatus = "not started"
+        solicitStatus = "not started"
         callActive = false
         callUid = -1L
         clearMusic()

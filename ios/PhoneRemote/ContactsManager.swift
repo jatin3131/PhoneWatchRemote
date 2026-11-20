@@ -2,7 +2,7 @@ import SwiftUI
 import Contacts
 import Combine
 
-/// Tells the watch what may be shared, and sends the phonebook when allowed.
+/// Tells the watch what may be shared, and sends the phonebook when allowed and when it changed.
 final class ContactsManager: ObservableObject {
 
     @Published var statusText = ""
@@ -14,6 +14,13 @@ final class ContactsManager: ObservableObject {
     func attach(ble: BluetoothManager, settings: FeatureSettings) {
         self.ble = ble
         self.settings = settings
+        ble.onContactsEvent = { [weak self] text in
+            if text == "CR" {
+                DispatchQueue.main.async {
+                    self?.syncIfAllowed(force: true)
+                }
+            }
+        }
         if cancellables.isEmpty {
             ble.$linkReady
                 .receive(on: DispatchQueue.main)
@@ -26,7 +33,7 @@ final class ContactsManager: ObservableObject {
         }
     }
 
-    func syncIfAllowed() {
+    func syncIfAllowed(force: Bool = false) {
         guard let ble = ble, ble.linkReady, let settings = settings else { return }
         let calls = settings.isOn("calls")
         let contacts = settings.isOn("contacts")
@@ -37,14 +44,14 @@ final class ContactsManager: ObservableObject {
         }
         let status = CNContactStore.authorizationStatus(for: .contacts)
         if status == .authorized {
-            sendContacts()
+            sendContacts(force: force)
             return
         }
         if status == .notDetermined {
             CNContactStore().requestAccess(for: .contacts) { granted, _ in
                 DispatchQueue.main.async {
                     if granted {
-                        self.sendContacts()
+                        self.sendContacts(force: true)
                     } else {
                         self.statusText = "access denied"
                     }
@@ -54,14 +61,23 @@ final class ContactsManager: ObservableObject {
         }
         if #available(iOS 18.0, *) {
             if status == .limited {
-                sendContacts()
+                sendContacts(force: force)
                 return
             }
         }
         statusText = "denied in Settings"
     }
 
-    private func sendContacts() {
+    private func fnv(_ data: Data) -> String {
+        var h: UInt64 = 14695981039346656037
+        for b in data {
+            h ^= UInt64(b)
+            h = h &* 1099511628211
+        }
+        return String(h)
+    }
+
+    private func sendContacts(force: Bool) {
         DispatchQueue.global(qos: .utility).async {
             let keys: [CNKeyDescriptor] = [
                 CNContactGivenNameKey as CNKeyDescriptor,
@@ -98,7 +114,13 @@ final class ContactsManager: ObservableObject {
             }
             let payload = lines.joined(separator: "\n").data(using: .utf8) ?? Data()
             let count = lines.count
+            let hash = self.fnv(payload)
             DispatchQueue.main.async {
+                if !force && UserDefaults.standard.string(forKey: "contacts_hash") == hash {
+                    self.statusText = "up to date (\(count))"
+                    return
+                }
+                UserDefaults.standard.set(hash, forKey: "contacts_hash")
                 self.ble?.sendMessage(type: 0x43, payload: payload)
                 self.statusText = "sent \(count) contacts"
             }

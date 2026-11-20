@@ -6,8 +6,11 @@ import android.app.NotificationChannel
 import android.app.NotificationManager
 import android.app.PendingIntent
 import android.app.Service
+import android.bluetooth.BluetoothAdapter
+import android.content.BroadcastReceiver
 import android.content.Context
 import android.content.Intent
+import android.content.IntentFilter
 import android.content.pm.PackageManager
 import android.content.pm.ServiceInfo
 import android.graphics.drawable.Icon
@@ -17,6 +20,7 @@ import android.media.Ringtone
 import android.media.RingtoneManager
 import android.media.session.MediaSession
 import android.media.session.PlaybackState
+import android.os.Build
 import android.os.IBinder
 import android.os.SystemClock
 import android.os.VibrationEffect
@@ -54,6 +58,7 @@ class LinkService : Service() {
         const val ACTION_PREV = "com.example.phoneremotewatch.PREV"
         const val EXTRA_OPEN_MUSIC = "open_music"
         const val EXTRA_OPEN_CALL = "open_call"
+        const val EXTRA_BOOT = "from_boot"
         private const val CHANNEL_ID = "link"
         private const val CALL_CHANNEL = "calls"
         private const val NOTIFICATION_ID = 7
@@ -67,6 +72,17 @@ class LinkService : Service() {
     private var ringing = false
     private var micType = false
     private var started = false
+    private var btRegistered = false
+
+    private val btReceiver = object : BroadcastReceiver() {
+        override fun onReceive(ctx: Context, intent: Intent) {
+            if (intent.action != BluetoothAdapter.ACTION_STATE_CHANGED) return
+            when (intent.getIntExtra(BluetoothAdapter.EXTRA_STATE, BluetoothAdapter.ERROR)) {
+                BluetoothAdapter.STATE_OFF -> link.onBluetoothState(false)
+                BluetoothAdapter.STATE_ON -> link.onBluetoothState(true)
+            }
+        }
+    }
 
     override fun onCreate() {
         super.onCreate()
@@ -101,6 +117,17 @@ class LinkService : Service() {
             setSessionActivity(openMusic)
         }
         link.listener = { onLinkChanged() }
+        try {
+            val filter = IntentFilter(BluetoothAdapter.ACTION_STATE_CHANGED)
+            if (Build.VERSION.SDK_INT >= 33) {
+                registerReceiver(btReceiver, filter, Context.RECEIVER_EXPORTED)
+            } else {
+                registerReceiver(btReceiver, filter)
+            }
+            btRegistered = true
+        } catch (e: Exception) {
+            // The link still works without live Bluetooth on/off updates.
+        }
     }
 
     override fun onBind(intent: Intent?): IBinder? = null
@@ -113,41 +140,46 @@ class LinkService : Service() {
             }
             ACTION_ANSWER -> {
                 link.answerCall()
-                return START_NOT_STICKY
+                return START_STICKY
             }
             ACTION_DECLINE -> {
                 link.declineCall()
-                return START_NOT_STICKY
+                return START_STICKY
             }
             ACTION_PLAYPAUSE -> {
                 link.sendEvent("MP")
-                return START_NOT_STICKY
+                return START_STICKY
             }
             ACTION_NEXT -> {
                 link.sendEvent("MN")
-                return START_NOT_STICKY
+                return START_STICKY
             }
             ACTION_PREV -> {
                 link.sendEvent("MV")
-                return START_NOT_STICKY
+                return START_STICKY
             }
         }
-        if (!enterForeground()) {
+        val fromBoot = intent?.getBooleanExtra(EXTRA_BOOT, false) == true
+        if (!enterForeground(!fromBoot)) {
             stopSelf()
             return START_NOT_STICKY
         }
         if (intent?.action == ACTION_RESTART || !link.running) {
-            link.start()
+            try {
+                link.start()
+            } catch (e: Exception) {
+                link.status = "Could not start: ${e.message}"
+            }
         }
-        return START_NOT_STICKY
+        return START_STICKY
     }
 
     private fun micGranted(): Boolean {
         return checkSelfPermission(Manifest.permission.RECORD_AUDIO) == PackageManager.PERMISSION_GRANTED
     }
 
-    private fun enterForeground(): Boolean {
-        val wantMic = link.hapticsOn && micGranted()
+    private fun enterForeground(allowMic: Boolean): Boolean {
+        val wantMic = allowMic && link.hapticsOn && micGranted()
         var type = ServiceInfo.FOREGROUND_SERVICE_TYPE_CONNECTED_DEVICE
         if (wantMic) {
             type = type or ServiceInfo.FOREGROUND_SERVICE_TYPE_MICROPHONE
@@ -241,7 +273,11 @@ class LinkService : Service() {
         } else {
             builder.setContentTitle("Phone Remote")
             builder.setContentText(
-                if (link.connectedAddress != null) "iPhone connected" else "Waiting for the iPhone"
+                when {
+                    !link.btOn -> "Bluetooth is off"
+                    link.connectedAddress != null -> "iPhone connected"
+                    else -> "Waiting for the iPhone"
+                }
             )
         }
         return builder.build()
@@ -399,7 +435,7 @@ class LinkService : Service() {
         if (!started) return
         val wantMic = link.hapticsOn && micGranted()
         if (wantMic != micType) {
-            enterForeground()
+            enterForeground(true)
         } else {
             refreshNotification()
         }
@@ -427,6 +463,14 @@ class LinkService : Service() {
         link.listener = null
         haptics?.stop()
         stopRinging()
+        if (btRegistered) {
+            try {
+                unregisterReceiver(btReceiver)
+            } catch (e: Exception) {
+                // Ignore.
+            }
+            btRegistered = false
+        }
         try {
             session?.release()
         } catch (e: Exception) {
