@@ -1,6 +1,7 @@
 package com.example.phoneremotewatch
 
 import android.Manifest
+import android.graphics.Bitmap
 import android.app.ActivityManager
 import android.content.Intent
 import android.provider.Settings
@@ -15,6 +16,8 @@ import androidx.activity.ComponentActivity
 import androidx.activity.compose.BackHandler
 import androidx.activity.compose.setContent
 import androidx.activity.result.contract.ActivityResultContracts
+import androidx.compose.animation.animateColorAsState
+import androidx.compose.animation.core.tween
 import androidx.compose.foundation.Canvas
 import androidx.compose.foundation.Image
 import androidx.compose.foundation.background
@@ -90,6 +93,61 @@ private enum class Glyph { PREV, NEXT, PLAY, PAUSE }
 private fun norm(value: Float, total: Int): Int {
     if (total <= 0) return 0
     return ((value / total.toFloat()) * 999f).toInt().coerceIn(0, 999)
+}
+
+private class Palette(val top: Color, val bottom: Color, val light: Boolean)
+
+private fun lumaOf(r: Int, g: Int, b: Int): Float {
+    return (0.299f * r + 0.587f * g + 0.114f * b) / 255f
+}
+
+/** Finds the two most frequent colours of a cover. Near-black counts as one colour; if it wins, the result is white. */
+private fun paletteFrom(src: Bitmap): Palette? {
+    try {
+        val small = Bitmap.createScaledBitmap(src, 24, 24, true)
+        val px = IntArray(24 * 24)
+        small.getPixels(px, 0, 24, 0, 0, 24, 24)
+        val counts = HashMap<Int, Int>()
+        val sumR = HashMap<Int, Int>()
+        val sumG = HashMap<Int, Int>()
+        val sumB = HashMap<Int, Int>()
+        for (p in px) {
+            val r = (p shr 16) and 0xFF
+            val g = (p shr 8) and 0xFF
+            val b = p and 0xFF
+            val key = if (maxOf(r, g, b) < 48) -1 else ((r shr 4) shl 8) or ((g shr 4) shl 4) or (b shr 4)
+            counts[key] = (counts[key] ?: 0) + 1
+            sumR[key] = (sumR[key] ?: 0) + r
+            sumG[key] = (sumG[key] ?: 0) + g
+            sumB[key] = (sumB[key] ?: 0) + b
+        }
+        val ordered = counts.entries.sortedByDescending { it.value }
+        if (ordered.isEmpty()) return null
+        val topKey = ordered[0].key
+        if (topKey == -1) {
+            return Palette(Color(0xFFFFFFFF), Color(0xFFE4E4EA), true)
+        }
+        fun avg(key: Int): Triple<Int, Int, Int> {
+            val n = counts[key] ?: 1
+            return Triple((sumR[key] ?: 0) / n, (sumG[key] ?: 0) / n, (sumB[key] ?: 0) / n)
+        }
+        val a = avg(topKey)
+        var second: Triple<Int, Int, Int>? = null
+        for (e in ordered) {
+            if (e.key == topKey || e.key == -1) continue
+            val c = avg(e.key)
+            val d = abs(c.first - a.first) + abs(c.second - a.second) + abs(c.third - a.third)
+            if (d > 90) {
+                second = c
+                break
+            }
+        }
+        val s = second ?: Triple(a.first * 55 / 100, a.second * 55 / 100, a.third * 55 / 100)
+        val light = (0.6f * lumaOf(a.first, a.second, a.third) + 0.4f * lumaOf(s.first, s.second, s.third)) > 0.55f
+        return Palette(Color(a.first, a.second, a.third), Color(s.first, s.second, s.third), light)
+    } catch (e: Exception) {
+        return null
+    }
 }
 
 class MainActivity : ComponentActivity() {
@@ -426,7 +484,7 @@ class MainActivity : ComponentActivity() {
                 fontSize = 14.sp
             )
             Text(
-                text = (if (connected) (if (link.dataReady) "data link ready" else "data link not ready") else link.status) + "  |  watch v10  |  media: " + link.amsStatus,
+                text = (if (connected) (if (link.dataReady) "data link ready" else "data link not ready") else link.status) + "  |  watch v11  |  media: " + link.amsStatus,
                 fontSize = 9.sp,
                 color = Color(0xFFAAAAAA),
                 textAlign = TextAlign.Center,
@@ -788,19 +846,19 @@ class MainActivity : ComponentActivity() {
     // ---------- Music ----------
 
     @Composable
-    private fun GlyphButton(glyph: Glyph, iconSize: Dp, filled: Boolean, onClick: () -> Unit) {
+    private fun GlyphButton(glyph: Glyph, iconSize: Dp, filled: Boolean, inkTint: Color = Color.White, fill: Color = Color(0xFFFF6B6B), onClick: () -> Unit) {
         Box(
             modifier = Modifier
                 .size(iconSize + 20.dp)
                 .clip(CircleShape)
-                .then(if (filled) Modifier.background(Color(0xFFFF6B6B)) else Modifier)
+                .then(if (filled) Modifier.background(fill) else Modifier)
                 .clickable(onClick = onClick),
             contentAlignment = Alignment.Center
         ) {
             Canvas(modifier = Modifier.size(iconSize)) {
                 val w = size.width
                 val h = size.height
-                val tint = Color.White
+                val tint = inkTint
                 when (glyph) {
                     Glyph.PLAY -> {
                         val p = Path().apply {
@@ -887,6 +945,17 @@ class MainActivity : ComponentActivity() {
         var lastAction by remember { mutableLongStateOf(0L) }
         var nowMs by remember { mutableLongStateOf(SystemClock.elapsedRealtime()) }
 
+        val art = link.musicArt
+        val palette = remember(art) { if (art != null) paletteFrom(art) else null }
+        val topColor by animateColorAsState(palette?.top ?: Color(0xFF3B2A4A), tween(700), label = "top")
+        val bottomColor by animateColorAsState(palette?.bottom ?: Color(0xFF16161A), tween(700), label = "bottom")
+        val light = palette?.light ?: false
+        val ink = if (light) Color(0xFF15151A) else Color.White
+        val inkSoft = if (light) Color(0xFF55555C) else Color(0xFFBBBBBB)
+        val inkFaint = if (light) Color(0xFF777780) else Color(0xFF8A8A8E)
+        val accent = if (light) Color(0xFF222226) else Color(0xFFFF6B6B)
+        val track = if (light) Color(0x33000000) else Color(0xFF55555C)
+
         LaunchedEffect(Unit) {
             focusRequester.requestFocus()
             link.sendEvent("MR")
@@ -912,7 +981,7 @@ class MainActivity : ComponentActivity() {
         Box(
             modifier = Modifier
                 .fillMaxSize()
-                .background(Brush.verticalGradient(listOf(Color(0xFF3B2A4A), Color(0xFF16161A))))
+                .background(Brush.verticalGradient(listOf(topColor, bottomColor)))
                 .onRotaryScrollEvent { event ->
                     acc += event.verticalScrollPixels
                     if (abs(acc) >= 10f) {
@@ -955,11 +1024,11 @@ class MainActivity : ComponentActivity() {
                     horizontalAlignment = Alignment.CenterHorizontally,
                     modifier = Modifier.padding(horizontal = 30.dp)
                 ) {
-                    Text(text = "♪", fontSize = 34.sp, color = Color(0xFFBBBBBB))
+                    Text(text = "♪", fontSize = 34.sp, color = inkSoft)
                     Text(
                         text = message,
                         fontSize = 12.sp,
-                        color = Color(0xFFCCCCCC),
+                        color = ink,
                         textAlign = TextAlign.Center
                     )
                 }
@@ -976,7 +1045,6 @@ class MainActivity : ComponentActivity() {
                             .background(Color(0xFF3A3A40)),
                         contentAlignment = Alignment.Center
                     ) {
-                        val art = link.musicArt
                         if (art != null) {
                             Image(
                                 bitmap = art.asImageBitmap(),
@@ -992,6 +1060,7 @@ class MainActivity : ComponentActivity() {
                     Text(
                         text = link.musicTitle,
                         fontSize = 14.sp,
+                        color = ink,
                         maxLines = 1,
                         overflow = TextOverflow.Ellipsis,
                         textAlign = TextAlign.Center
@@ -999,7 +1068,7 @@ class MainActivity : ComponentActivity() {
                     Text(
                         text = link.musicArtist,
                         fontSize = 11.sp,
-                        color = Color(0xFFBBBBBB),
+                        color = inkSoft,
                         maxLines = 1,
                         overflow = TextOverflow.Ellipsis,
                         textAlign = TextAlign.Center
@@ -1010,13 +1079,13 @@ class MainActivity : ComponentActivity() {
                             .width(100.dp)
                             .height(4.dp)
                             .clip(RoundedCornerShape(2.dp))
-                            .background(Color(0xFF55555C))
+                            .background(track)
                     ) {
                         Box(
                             modifier = Modifier
                                 .fillMaxWidth(fraction)
                                 .fillMaxHeight()
-                                .background(Color(0xFFFF6B6B))
+                                .background(accent)
                         )
                     }
                     Spacer(modifier = Modifier.height(2.dp))
@@ -1024,16 +1093,22 @@ class MainActivity : ComponentActivity() {
                         verticalAlignment = Alignment.CenterVertically,
                         horizontalArrangement = Arrangement.spacedBy(2.dp)
                     ) {
-                        GlyphButton(Glyph.PREV, 16.dp, false) { link.sendEvent("MV") }
-                        GlyphButton(if (link.musicPlaying) Glyph.PAUSE else Glyph.PLAY, 18.dp, true) {
+                        GlyphButton(Glyph.PREV, 16.dp, false, inkTint = ink) { link.sendEvent("MV") }
+                        GlyphButton(
+                            if (link.musicPlaying) Glyph.PAUSE else Glyph.PLAY,
+                            18.dp,
+                            true,
+                            inkTint = Color.White,
+                            fill = accent
+                        ) {
                             link.sendEvent("MP")
                         }
-                        GlyphButton(Glyph.NEXT, 16.dp, false) { link.sendEvent("MN") }
+                        GlyphButton(Glyph.NEXT, 16.dp, false, inkTint = ink) { link.sendEvent("MN") }
                     }
                     Text(
                         text = if (link.amsReady) "bezel: skip   swipe: volume" else "Apple Music only - media link down. Tap Fix",
                         fontSize = 8.sp,
-                        color = Color(0xFF8A8A8E)
+                        color = inkFaint
                     )
                 }
             }

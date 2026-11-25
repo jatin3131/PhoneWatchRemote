@@ -20,6 +20,7 @@ import android.media.Ringtone
 import android.media.RingtoneManager
 import android.media.session.MediaSession
 import android.media.session.PlaybackState
+import android.os.BatteryManager
 import android.os.Build
 import android.os.IBinder
 import android.os.SystemClock
@@ -73,6 +74,25 @@ class LinkService : Service() {
     private var micType = false
     private var started = false
     private var btRegistered = false
+    private var batRegistered = false
+
+    private fun readBattery(intent: Intent?) {
+        if (intent == null) return
+        val level = intent.getIntExtra(BatteryManager.EXTRA_LEVEL, -1)
+        val scale = intent.getIntExtra(BatteryManager.EXTRA_SCALE, 100)
+        val status = intent.getIntExtra(BatteryManager.EXTRA_STATUS, -1)
+        if (level < 0 || scale <= 0) return
+        val pct = level * 100 / scale
+        val charging = status == BatteryManager.BATTERY_STATUS_CHARGING ||
+            status == BatteryManager.BATTERY_STATUS_FULL
+        link.setBattery(pct, charging)
+    }
+
+    private val batteryReceiver = object : BroadcastReceiver() {
+        override fun onReceive(ctx: Context, intent: Intent) {
+            readBattery(intent)
+        }
+    }
 
     private val btReceiver = object : BroadcastReceiver() {
         override fun onReceive(ctx: Context, intent: Intent) {
@@ -117,6 +137,18 @@ class LinkService : Service() {
             setSessionActivity(openMusic)
         }
         link.listener = { onLinkChanged() }
+        try {
+            val batFilter = IntentFilter(Intent.ACTION_BATTERY_CHANGED)
+            val sticky = if (Build.VERSION.SDK_INT >= 33) {
+                registerReceiver(batteryReceiver, batFilter, Context.RECEIVER_EXPORTED)
+            } else {
+                registerReceiver(batteryReceiver, batFilter)
+            }
+            batRegistered = true
+            readBattery(sticky)
+        } catch (e: Exception) {
+            // Battery updates are optional.
+        }
         try {
             val filter = IntentFilter(BluetoothAdapter.ACTION_STATE_CHANGED)
             if (Build.VERSION.SDK_INT >= 33) {
@@ -463,6 +495,14 @@ class LinkService : Service() {
         link.listener = null
         haptics?.stop()
         stopRinging()
+        if (batRegistered) {
+            try {
+                unregisterReceiver(batteryReceiver)
+            } catch (e: Exception) {
+                // Ignore.
+            }
+            batRegistered = false
+        }
         if (btRegistered) {
             try {
                 unregisterReceiver(btReceiver)

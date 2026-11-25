@@ -405,6 +405,9 @@ class BleLink(private val context: Context) {
                 main.post {
                     subscribedDevice = if (enabled) device else null
                     dataReady = enabled
+                    if (enabled) {
+                        main.postDelayed({ sendBattery() }, 1500L)
+                    }
                 }
             }
             if (responseNeeded) {
@@ -1287,6 +1290,21 @@ class BleLink(private val context: Context) {
         running = true
         main.removeCallbacks(heartbeat)
         main.postDelayed(heartbeat, 30000L)
+    }
+
+    var batteryLevel = -1
+    var batteryCharging = false
+
+    fun setBattery(level: Int, charging: Boolean) {
+        val diff = level != batteryLevel || charging != batteryCharging
+        batteryLevel = level
+        batteryCharging = charging
+        if (diff) sendBattery()
+    }
+
+    fun sendBattery() {
+        if (batteryLevel < 0 || !dataReady) return
+        sendEvent("BAT $batteryLevel ${if (batteryCharging) 1 else 0}")
     }
 
     /** Sends a short message to the iPhone app. Music commands go to the iPhone's media service when it is ready. */
