@@ -126,6 +126,8 @@ final class RemoteModel: ObservableObject {
     @Published var editValues: [Double] = Array(repeating: 0, count: 11)
     @Published var editRendered: UIImage? = nil
     @Published var lastEditIndex = 0
+    @Published var watchBattery = -1
+    @Published var watchCharging = false
 
     var pinchBase: CGFloat = 1.0
     var lastGallery = false
@@ -209,6 +211,11 @@ final class RemoteModel: ObservableObject {
         guard let cmd = parts.first else { return }
 
         switch cmd {
+        case "BAT":
+            if parts.count >= 3, let level = Int(parts[1]) {
+                watchBattery = max(0, min(100, level))
+                watchCharging = (parts[2] == "1")
+            }
         case "APP":
             if parts.count >= 2 && parts[1] == "G" {
                 openGalleryTick += 1

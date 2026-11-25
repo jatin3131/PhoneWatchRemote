@@ -23,9 +23,10 @@ final class FeatureSettings: ObservableObject {
     @Published private(set) var values: [String: Bool] = [:]
 
     init() {
-        for feature in Self.features {
-            let saved = UserDefaults.standard.object(forKey: "feature_" + feature.id) as? Bool
-            values[feature.id] = saved ?? true
+        let ids = Self.features.map { $0.id } + ["island"]
+        for id in ids {
+            let saved = UserDefaults.standard.object(forKey: "feature_" + id) as? Bool
+            values[id] = saved ?? true
         }
     }
 

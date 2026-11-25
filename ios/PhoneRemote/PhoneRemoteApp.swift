@@ -8,6 +8,7 @@ struct PhoneRemoteApp: App {
     @StateObject private var music = MusicManager()
     @StateObject private var contacts = ContactsManager()
     @StateObject private var artwork = ArtworkManager()
+    @StateObject private var island = IslandManager()
 
     var body: some Scene {
         WindowGroup {
@@ -18,6 +19,7 @@ struct PhoneRemoteApp: App {
                 .environmentObject(music)
                 .environmentObject(contacts)
                 .environmentObject(artwork)
+                .environmentObject(island)
         }
     }
 }

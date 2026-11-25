@@ -35,6 +35,7 @@ struct RootView: View {
     @EnvironmentObject var settings: FeatureSettings
     @EnvironmentObject var contacts: ContactsManager
     @EnvironmentObject var artwork: ArtworkManager
+    @EnvironmentObject var island: IslandManager
     @State private var skipped = false
 
     var body: some View {
@@ -51,6 +52,7 @@ struct RootView: View {
             music.attach(ble: ble, settings: settings)
             contacts.attach(ble: ble, settings: settings)
             artwork.attach(ble: ble)
+            island.attach(ble: ble, remote: remote, settings: settings)
         }
     }
 }
@@ -263,6 +265,8 @@ struct MainView: View {
                     }
 
                     MusicCard()
+
+                    IslandCard()
 
                     Button("Gallery") {
                         openGallery()
