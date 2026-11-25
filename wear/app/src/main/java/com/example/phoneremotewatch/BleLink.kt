@@ -136,6 +136,11 @@ class BleLink(private val context: Context) {
     private val ops = ArrayDeque<() -> Boolean>()
     private var busy = false
     private var amsRetries = 0
+    private var amsFailures = 0
+    private var recoverPending = false
+    private var amsLastError = ""
+    private var lastPingMs = 0L
+    private var opStamp = 0
     private var receiverRegistered = false
     private var contactsRequested = false
     private val liveLinks = HashSet<String>()
@@ -304,8 +309,15 @@ class BleLink(private val context: Context) {
             if (connectedAddress == null && btOn) {
                 startAdvertising()
             }
-            if (connectedAddress != null && !amsReady && clientGatt == null && phoneDevice != null) {
-                startAms()
+            val phone = phoneDevice
+            if (connectedAddress != null && phone != null) {
+                if (!amsReady) {
+                    if (!recoverPending && phone.bondState != BluetoothDevice.BOND_BONDING) {
+                        scheduleAmsRetry(false)
+                    }
+                } else if (SystemClock.elapsedRealtime() - lastPingMs > 300000L) {
+                    pingMedia()
+                }
             }
             main.postDelayed(this, 30000L)
         }
@@ -654,6 +666,13 @@ class BleLink(private val context: Context) {
             }
             if (started) {
                 busy = true
+                opStamp += 1
+                val stamp = opStamp
+                main.postDelayed({
+                    if (busy && opStamp == stamp) {
+                        amsFailed("operation timed out", -1)
+                    }
+                }, 7000L)
                 return
             }
         }
@@ -698,6 +717,7 @@ class BleLink(private val context: Context) {
         ancsQueue.clear()
         ancsFetching = false
         try {
+            refreshGattCache(clientGatt)
             clientGatt?.disconnect()
         } catch (e: Exception) {
             // Ignore.
@@ -722,28 +742,139 @@ class BleLink(private val context: Context) {
         }
     }
 
-    private fun scheduleAmsRetry() {
-        if (amsRetries >= 30) return
-        amsRetries += 1
+    private fun refreshGattCache(gatt: BluetoothGatt?) {
+        if (gatt == null) return
+        try {
+            val m = gatt.javaClass.getMethod("refresh")
+            m.invoke(gatt)
+        } catch (e: Exception) {
+            // Not available on this watch. Reconnecting still helps.
+        }
+    }
+
+    private fun removeBondAndRepair(device: BluetoothDevice) {
+        stopAmsClient()
+        val removed = try {
+            val m = device.javaClass.getMethod("removeBond")
+            (m.invoke(device) as? Boolean) == true
+        } catch (e: Exception) {
+            false
+        }
+        if (!removed) {
+            amsStatus = "old pairing stuck. Forget the watch in iPhone Settings > Bluetooth, then use Restart link"
+            changed()
+            return
+        }
+        amsStatus = "re-pairing: accept the request on the iPhone and the watch"
+        changed()
         main.postDelayed({
-            if (!amsReady && connectedAddress != null) {
-                startAms()
+            val d = phoneDevice
+            if (d != null && connectedAddress != null) {
+                try {
+                    d.createBond()
+                } catch (e: Exception) {
+                    // Ignore.
+                }
             }
-        }, 12000L)
+        }, 2000L)
+    }
+
+    private fun maybeRestartProcess(): Boolean {
+        val last = prefs.getLong("last_kill_ms", 0L)
+        val now = System.currentTimeMillis()
+        if (now - last < 6L * 60L * 60L * 1000L) return false
+        prefs.edit().putLong("last_kill_ms", now).commit()
+        amsStatus = "restarting the app to clear a stuck Bluetooth state..."
+        changed()
+        main.postDelayed({ android.os.Process.killProcess(android.os.Process.myPid()) }, 800L)
+        return true
+    }
+
+    private fun amsFailed(what: String, code: Int) {
+        ops.clear()
+        busy = false
+        amsReady = false
+        amsLastError = "$what (code $code)"
+        amsStatus = amsLastError
+        changed()
+        scheduleAmsRetry()
+    }
+
+    private fun scheduleAmsRetry(fast: Boolean = false) {
+        if (connectedAddress == null || recoverPending) return
+        recoverPending = true
+        amsFailures += 1
+        val step = amsFailures
+        val delayMs = if (fast) 600L else minOf(60000L, 4000L + 4000L * step)
+        val shown = if (amsLastError.isNotEmpty()) amsLastError else "media link down"
+        amsStatus = "$shown - fixing automatically (try $step)"
+        changed()
+        main.postDelayed({
+            recoverPending = false
+            if (!amsReady && connectedAddress != null) {
+                val dev = phoneDevice
+                if (step == 3 && dev != null && dev.bondState == BluetoothDevice.BOND_BONDED) {
+                    removeBondAndRepair(dev)
+                } else if (step == 7) {
+                    amsStatus = "restarting the Bluetooth link..."
+                    changed()
+                    start()
+                } else if (step == 10 && maybeRestartProcess()) {
+                    // The app restarts itself.
+                } else {
+                    startAms()
+                }
+            }
+        }, delayMs)
+    }
+
+    private fun pingMedia() {
+        val gatt = clientGatt ?: return
+        val ch = amsUpdateChar ?: return
+        lastPingMs = SystemClock.elapsedRealtime()
+        queueOp { writeChar(gatt, ch, byteArrayOf(0, 1, 2)) }
+    }
+
+    /** Called when the Music screen opens: repairs a dead link or checks that a working one is alive. */
+    fun checkMedia() {
+        if (connectedAddress == null) return
+        if (!amsReady) {
+            if (!recoverPending) scheduleAmsRetry(true)
+        } else {
+            pingMedia()
+        }
+    }
+
+    /** The Fix button. */
+    fun fixMusicNow() {
+        if (connectedAddress == null) {
+            amsStatus = "not connected to the iPhone yet"
+            changed()
+            return
+        }
+        recoverPending = false
+        stopAmsClient()
+        scheduleAmsRetry(true)
     }
 
     private fun needPairing() {
         ops.clear()
         busy = false
-        amsStatus = "pairing needed: accept the request on the iPhone and the watch"
+        amsReady = false
         val dev = phoneDevice
         if (dev != null && dev.bondState == BluetoothDevice.BOND_NONE) {
+            amsStatus = "pairing needed: accept the request on the iPhone and the watch"
+            changed()
             try {
                 dev.createBond()
             } catch (e: Exception) {
                 // Pairing may already be running.
             }
+            return
         }
+        amsLastError = "encryption refused (old pairing?)"
+        amsStatus = amsLastError
+        changed()
         scheduleAmsRetry()
     }
 
@@ -786,7 +917,8 @@ class BleLink(private val context: Context) {
         override fun onServicesDiscovered(gatt: BluetoothGatt, gattStatus: Int) {
             main.post {
                 if (gattStatus != BluetoothGatt.GATT_SUCCESS) {
-                    amsStatus = "service search failed (code $gattStatus)"
+                    amsLastError = "service search failed (code $gattStatus)"
+                    amsStatus = amsLastError
                     scheduleAmsRetry()
                     return@post
                 }
@@ -842,7 +974,7 @@ class BleLink(private val context: Context) {
                 } else {
                     ops.clear()
                     busy = false
-                    amsStatus = "subscribe failed (code $gattStatus)"
+                    amsFailed("subscribe failed", gattStatus)
                 }
             }
         }
@@ -853,6 +985,9 @@ class BleLink(private val context: Context) {
                     if (characteristic.uuid == AMS_UPDATE && !amsReady) {
                         amsReady = true
                         amsStatus = "connected - any music app"
+                        amsFailures = 0
+                        amsLastError = ""
+                        recoverPending = false
                         changed()
                     }
                     opDone()
@@ -863,7 +998,11 @@ class BleLink(private val context: Context) {
                         ancsStatus = "call request refused (code $gattStatus)"
                         ancsFetching = false
                     } else {
-                        amsStatus = "media command refused (code $gattStatus)"
+                        if (gattStatus in 0xA0..0xAF) {
+                            amsStatus = "the music app refused that command (code $gattStatus)"
+                        } else {
+                            amsFailed("media command failed", gattStatus)
+                        }
                     }
                     opDone()
                 }

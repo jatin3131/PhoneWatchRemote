@@ -426,7 +426,7 @@ class MainActivity : ComponentActivity() {
                 fontSize = 14.sp
             )
             Text(
-                text = (if (connected) (if (link.dataReady) "data link ready" else "data link not ready") else link.status) + "  |  watch v9  |  media: " + link.amsStatus,
+                text = (if (connected) (if (link.dataReady) "data link ready" else "data link not ready") else link.status) + "  |  watch v10  |  media: " + link.amsStatus,
                 fontSize = 9.sp,
                 color = Color(0xFFAAAAAA),
                 textAlign = TextAlign.Center,
@@ -447,7 +447,7 @@ class MainActivity : ComponentActivity() {
                     }
                 }
                 Bubble("🔔", "Alerts", hasNotificationPermission(), 36.dp) { requestNotifications() }
-                Bubble("🎵", "Music", link.phoneMusic || link.amsReady, 36.dp) {
+                Bubble("🎵", "Music", link.amsReady, 36.dp) {
                     hintText = "Music: " + link.amsStatus
                 }
                 Bubble("🖼", "Gallery", link.phoneGallery, 36.dp)
@@ -858,6 +858,17 @@ class MainActivity : ComponentActivity() {
             ) {
                 Text(text = "📳", fontSize = 13.sp)
             }
+            if (!link.amsReady) {
+                Text(
+                    text = "Fix",
+                    fontSize = 10.sp,
+                    color = Color(0xFFFFCC80),
+                    modifier = Modifier
+                        .clip(CircleShape)
+                        .clickable { link.fixMusicNow() }
+                        .padding(horizontal = 6.dp, vertical = 3.dp)
+                )
+            }
             if (link.hapticsOn) {
                 Text(text = "👂", fontSize = 12.sp)
                 Text(
@@ -879,6 +890,7 @@ class MainActivity : ComponentActivity() {
         LaunchedEffect(Unit) {
             focusRequester.requestFocus()
             link.sendEvent("MR")
+            link.checkMedia()
         }
         LaunchedEffect(Unit) {
             while (true) {
@@ -936,7 +948,7 @@ class MainActivity : ComponentActivity() {
             if (!hasTrack) {
                 val message = when {
                     link.connectedAddress == null -> "Not connected"
-                    !link.amsReady && !link.phoneMusic -> "Media link: " + link.amsStatus
+                    !link.amsReady -> "Media link: " + link.amsStatus + "\nTap Fix, bottom left"
                     else -> "Nothing playing.\nStart a song in any music app on the iPhone."
                 }
                 Column(
@@ -1019,7 +1031,7 @@ class MainActivity : ComponentActivity() {
                         GlyphButton(Glyph.NEXT, 16.dp, false) { link.sendEvent("MN") }
                     }
                     Text(
-                        text = "bezel: skip   swipe: volume",
+                        text = if (link.amsReady) "bezel: skip   swipe: volume" else "Apple Music only - media link down. Tap Fix",
                         fontSize = 8.sp,
                         color = Color(0xFF8A8A8E)
                     )
