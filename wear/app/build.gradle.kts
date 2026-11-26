@@ -38,4 +38,5 @@ dependencies {
     implementation(libs.androidx.activity.compose)
     implementation(libs.androidx.wear.compose.material3)
     implementation(libs.androidx.wear.compose.foundation)
+    implementation("androidx.health:health-services-client:1.1.0")
 }

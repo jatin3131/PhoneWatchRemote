@@ -326,6 +326,29 @@ class MainActivity : ComponentActivity() {
         permissionVersion += 1
     }
 
+    private val healthLauncher =
+        registerForActivityResult(ActivityResultContracts.RequestMultiplePermissions()) {
+            permissionVersion += 1
+            link.configureHealth()
+        }
+
+    private fun hrPermission(): String {
+        return if (Build.VERSION.SDK_INT >= 36) {
+            "android.permission.health.READ_HEART_RATE"
+        } else {
+            Manifest.permission.BODY_SENSORS
+        }
+    }
+
+    private fun healthPermsOK(): Boolean {
+        return checkSelfPermission(hrPermission()) == PackageManager.PERMISSION_GRANTED &&
+            checkSelfPermission(Manifest.permission.ACTIVITY_RECOGNITION) == PackageManager.PERMISSION_GRANTED
+    }
+
+    private fun requestHealth() {
+        healthLauncher.launch(arrayOf(hrPermission(), Manifest.permission.ACTIVITY_RECOGNITION))
+    }
+
     private fun resetApp() {
         link.markLinkEnabled(true)
         try {
@@ -505,7 +528,7 @@ class MainActivity : ComponentActivity() {
                 fontSize = 14.sp
             )
             Text(
-                text = (if (connected) (if (link.dataReady) "data link ready" else "data link not ready") else link.status) + "  |  watch v12  |  media: " + link.amsStatus,
+                text = (if (connected) (if (link.dataReady) "data link ready" else "data link not ready") else link.status) + "  |  watch v13  |  media: " + link.amsStatus,
                 fontSize = 9.sp,
                 color = Color(0xFFAAAAAA),
                 textAlign = TextAlign.Center,
@@ -533,7 +556,7 @@ class MainActivity : ComponentActivity() {
             }
             Spacer(modifier = Modifier.height(4.dp))
             Row(horizontalArrangement = Arrangement.spacedBy(5.dp)) {
-                Bubble("❤", "Health", false, 36.dp)
+                Bubble("❤", "Health", healthPermsOK(), 36.dp) { requestHealth() }
                 Bubble("📞", "Calls", link.ancsReady && link.shareCalls, 36.dp) {
                     hintText = "Calls: " + link.ancsStatus
                 }
@@ -616,7 +639,11 @@ class MainActivity : ComponentActivity() {
             Spacer(modifier = Modifier.height(6.dp))
             Row(horizontalArrangement = Arrangement.spacedBy(12.dp)) {
                 Bubble("❤", "Health", false, 48.dp) {
-                    hintText = "Health is not built yet"
+                    if (!healthPermsOK()) {
+                        requestHealth()
+                    } else {
+                        hintText = link.healthStatus()
+                    }
                 }
                 Bubble("👤", "Contacts", link.contactCount > 0, 48.dp) {
                     contactsOpen = true

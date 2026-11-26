@@ -107,6 +107,16 @@ class BleLink(private val context: Context) {
     var ringOnWatch by mutableStateOf(prefs.getBoolean("ring_watch", true))
     var bezelCalls by mutableStateOf(prefs.getBoolean("bezel_calls", true))
 
+    var healthMask by mutableIntStateOf(prefs.getInt("health_mask", 7))
+    var healthMinutes by mutableIntStateOf(prefs.getInt("health_minutes", 5))
+    val health = HealthSource(context) { }
+    private val healthTick = object : Runnable {
+        override fun run() {
+            sendHealth()
+            main.postDelayed(this, healthMinutes * 60000L)
+        }
+    }
+
     var running = false
     var listener: (() -> Unit)? = null
 
@@ -408,6 +418,10 @@ class BleLink(private val context: Context) {
                     dataReady = enabled
                     if (enabled) {
                         main.postDelayed({ sendBattery() }, 1500L)
+                        main.postDelayed({
+                            sendHealth()
+                            restartHealthTimer()
+                        }, 2500L)
                     }
                 }
             }
@@ -540,6 +554,13 @@ class BleLink(private val context: Context) {
             }
             "I" -> mode = WatchMode.IDLE
             "SD" -> savedTick += 1
+            "HS" -> {
+                healthMask = (parts.getOrNull(1)?.toIntOrNull() ?: healthMask) and 63
+                healthMinutes = (parts.getOrNull(2)?.toIntOrNull() ?: healthMinutes).coerceIn(1, 120)
+                prefs.edit().putInt("health_mask", healthMask).putInt("health_minutes", healthMinutes).apply()
+                configureHealth()
+                main.postDelayed({ sendHealth() }, 1500L)
+            }
             "SF" -> saveFailTick += 1
             "P" -> {
                 phoneGallery = parts.getOrNull(1) == "1"
@@ -1319,6 +1340,7 @@ class BleLink(private val context: Context) {
         gattServer.addService(service)
         status = "Starting..."
         running = true
+        configureHealth()
         main.removeCallbacks(heartbeat)
         main.postDelayed(heartbeat, 30000L)
     }
@@ -1326,11 +1348,49 @@ class BleLink(private val context: Context) {
     var batteryLevel = -1
     var batteryCharging = false
 
+    fun configureHealth() {
+        health.configure(healthMask)
+        restartHealthTimer()
+    }
+
+    private fun restartHealthTimer() {
+        main.removeCallbacks(healthTick)
+        if (healthMask != 0 && connectedAddress != null) {
+            main.postDelayed(healthTick, healthMinutes * 60000L)
+        }
+    }
+
+    /** Sends the chosen numbers to the iPhone app, which shows them on the Dynamic Island. */
+    fun sendHealth() {
+        if (!dataReady || healthMask == 0) return
+        val sb = StringBuilder()
+        if ((healthMask and 1) != 0 && batteryLevel >= 0) {
+            sb.append("b=").append(batteryLevel).append(',').append(if (batteryCharging) 1 else 0).append(';')
+        }
+        if ((healthMask and 2) != 0 && health.heartRate > 0) {
+            val age = ((System.currentTimeMillis() - health.hrTimeMs) / 60000L).toInt()
+            sb.append("h=").append(health.heartRate).append(',').append(age).append(';')
+        }
+        if ((healthMask and 4) != 0 && health.steps >= 0) sb.append("s=").append(health.steps).append(';')
+        if ((healthMask and 8) != 0 && health.calories >= 0) sb.append("c=").append(health.calories.toInt()).append(';')
+        if ((healthMask and 16) != 0 && health.distance >= 0) sb.append("d=").append(health.distance.toInt()).append(';')
+        if ((healthMask and 32) != 0 && health.floors >= 0) sb.append("f=").append(health.floors.toInt()).append(';')
+        sb.append("t=").append(System.currentTimeMillis() / 1000L)
+        sendFrame(0x48, sb.toString().toByteArray(Charsets.UTF_8))
+    }
+
+    fun healthStatus(): String {
+        if (!health.hasHeartPermission() || !health.hasActivityPermission()) {
+            return "Tap the heart bubble to allow health access"
+        }
+        return "Health: " + health.status + " (every $healthMinutes min)"
+    }
+
     fun setBattery(level: Int, charging: Boolean) {
         val diff = level != batteryLevel || charging != batteryCharging
         batteryLevel = level
         batteryCharging = charging
-        if (diff) sendBattery()
+        if (diff && healthMask == 0) sendBattery()
     }
 
     fun sendBattery() {
@@ -1360,6 +1420,8 @@ class BleLink(private val context: Context) {
 
     fun stop() {
         main.removeCallbacks(heartbeat)
+        main.removeCallbacks(healthTick)
+        health.stop()
         stopAmsClient()
         if (receiverRegistered) {
             try {
