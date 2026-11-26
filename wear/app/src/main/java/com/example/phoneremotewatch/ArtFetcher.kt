@@ -3,12 +3,18 @@ package com.example.phoneremotewatch
 import android.graphics.Bitmap
 import android.graphics.BitmapFactory
 import org.json.JSONObject
+import java.io.ByteArrayOutputStream
 import java.net.HttpURLConnection
 import java.net.URL
 import java.net.URLEncoder
+import java.util.concurrent.ConcurrentHashMap
 
-/** Looks up an album cover straight from the watch when it has internet. */
+/** Looks up album covers and genres straight from the web when the watch has internet. */
 object ArtFetcher {
+
+    class Candidate(val title: String, val artist: String, val coverUrl: String)
+
+    private val genreCache = ConcurrentHashMap<String, String>()
 
     private fun tokens(s: String): Set<String> {
         var t = s.lowercase()
@@ -59,6 +65,17 @@ object ArtFetcher {
         return Bitmap.createScaledBitmap(bmp, 160, 160, true)
     }
 
+    fun toJpeg(bmp: Bitmap): ByteArray {
+        val out = ByteArrayOutputStream()
+        bmp.compress(Bitmap.CompressFormat.JPEG, 80, out)
+        return out.toByteArray()
+    }
+
+    fun imageBytes(url: String): ByteArray? {
+        val bmp = image(url) ?: return null
+        return toJpeg(bmp)
+    }
+
     private fun fromItunes(title: String, artist: String): Bitmap? {
         val q = URLEncoder.encode((artist + " " + title).trim(), "UTF-8")
         val body = httpGet("https://itunes.apple.com/search?term=$q&media=music&entity=song&limit=15") ?: return null
@@ -66,6 +83,7 @@ object ArtFetcher {
         val wt = tokens(title)
         val wa = tokens(artist)
         var bestUrl: String? = null
+        var bestGenre = ""
         var best = 0.0
         for (i in 0 until arr.length()) {
             val o = arr.getJSONObject(i)
@@ -75,9 +93,11 @@ object ArtFetcher {
             if (s > best) {
                 best = s
                 bestUrl = url
+                bestGenre = o.optString("primaryGenreName", "")
             }
         }
         val u = bestUrl ?: return null
+        if (bestGenre.isNotEmpty()) genreCache[CoverStore.keyOf(title)] = bestGenre
         return image(u.replace("100x100", "300x300"))
     }
 
@@ -104,6 +124,7 @@ object ArtFetcher {
         return image(u)
     }
 
+    /** Cover for the song that is playing now. */
     fun fetch(title: String, artist: String, done: (Bitmap?) -> Unit) {
         Thread {
             var bmp: Bitmap? = null
@@ -121,5 +142,81 @@ object ArtFetcher {
             }
             done(bmp)
         }.start()
+    }
+
+    /** Cover bytes for a predicted song. */
+    fun bytesFor(title: String, artist: String): ByteArray? {
+        var bmp: Bitmap? = null
+        try {
+            bmp = fromItunes(title, artist)
+        } catch (e: Exception) {
+            // Try the next source.
+        }
+        if (bmp == null) {
+            try {
+                bmp = fromDeezer(title, artist)
+            } catch (e: Exception) {
+                // Nothing found.
+            }
+        }
+        return if (bmp == null) null else toJpeg(bmp)
+    }
+
+    /** Genre of a song: remembered, or one quick lookup. Empty if unknown. */
+    fun genreOf(title: String, artist: String): String {
+        val key = CoverStore.keyOf(title)
+        val known = genreCache[key]
+        if (known != null) return known
+        try {
+            val q = URLEncoder.encode((artist + " " + title).trim(), "UTF-8")
+            val body = httpGet("https://itunes.apple.com/search?term=$q&media=music&entity=song&limit=8") ?: return ""
+            val arr = JSONObject(String(body, Charsets.UTF_8)).optJSONArray("results") ?: return ""
+            val wt = tokens(title)
+            val wa = tokens(artist)
+            var best = 0.0
+            var genre = ""
+            for (i in 0 until arr.length()) {
+                val o = arr.getJSONObject(i)
+                val s = score(wt, wa, o.optString("trackName", ""), o.optString("artistName", ""))
+                if (s > best) {
+                    best = s
+                    genre = o.optString("primaryGenreName", "")
+                }
+            }
+            if (genre.isNotEmpty()) genreCache[key] = genre
+            return genre
+        } catch (e: Exception) {
+            return ""
+        }
+    }
+
+    private fun searchList(query: String, limit: Int, byArtist: Boolean): List<Candidate> {
+        val out = ArrayList<Candidate>()
+        try {
+            val q = URLEncoder.encode(query, "UTF-8")
+            val attr = if (byArtist) "&attribute=artistTerm" else ""
+            val body = httpGet("https://itunes.apple.com/search?term=$q&media=music&entity=song$attr&limit=$limit") ?: return out
+            val arr = JSONObject(String(body, Charsets.UTF_8)).optJSONArray("results") ?: return out
+            for (i in 0 until arr.length()) {
+                val o = arr.getJSONObject(i)
+                val url = o.optString("artworkUrl100", "")
+                if (url.isEmpty()) continue
+                val name = o.optString("trackName", "")
+                val genre = o.optString("primaryGenreName", "")
+                if (genre.isNotEmpty()) genreCache[CoverStore.keyOf(name)] = genre
+                out.add(Candidate(name, o.optString("artistName", ""), url.replace("100x100", "300x300")))
+            }
+        } catch (e: Exception) {
+            // Return what we have.
+        }
+        return out
+    }
+
+    fun artistTracks(artist: String, limit: Int): List<Candidate> {
+        return searchList(artist, limit, true)
+    }
+
+    fun genreTracks(genre: String, limit: Int): List<Candidate> {
+        return searchList(genre, limit, false)
     }
 }

@@ -138,6 +138,10 @@ class BleLink(private val context: Context) {
     private val artCache = HashMap<String, Bitmap>()
     private var lastArtKey = ""
     private var lastArtAsk = 0L
+    private val store = CoverStore(context)
+    private val history = PlayHistory(context)
+    private val prefetcher = CoverPrefetcher(store, history)
+
 
     private var phoneDevice: BluetoothDevice? = null
     private var clientGatt: BluetoothGatt? = null
@@ -517,18 +521,12 @@ class BleLink(private val context: Context) {
             }
             0x42 -> {
                 val nl = payload.indexOf(10.toByte())
-                if (nl > 0) {
-                    val title = String(payload, 0, nl, Charsets.UTF_8).trim().lowercase()
-                    val imgLen = payload.size - nl - 1
-                    if (imgLen > 0) {
-                        val bmp = BitmapFactory.decodeByteArray(payload, nl + 1, imgLen)
-                        if (bmp != null) {
-                            if (artCache.size > 30) artCache.clear()
-                            artCache[title] = bmp
-                            if (title == musicTitle.trim().lowercase() && !titlesMatch()) {
-                                musicArt = bmp
-                            }
-                        }
+                if (nl > 0 && payload.size > nl + 1) {
+                    val coverTitle = String(payload, 0, nl, Charsets.UTF_8).trim()
+                    val ckey = CoverStore.keyOf(coverTitle)
+                    store.putPlayed(ckey, payload.copyOfRange(nl + 1, payload.size))
+                    if (CoverStore.keyOf(musicTitle) == ckey && !titlesMatch()) {
+                        musicArt = store.get(ckey)
                     }
                 }
             }
@@ -1074,11 +1072,14 @@ class BleLink(private val context: Context) {
         } else if (entity == 2) {
             when (attr) {
                 0 -> musicArtist = value
-                2 -> musicTitle = value
+                2 -> {
+                    musicTitle = value
+                    prefetcher.cancel()
+                }
                 3 -> musicDurationSec = (value.trim().toDoubleOrNull() ?: 0.0).toInt()
             }
             if (attr == 0 || attr == 2) {
-                musicArt = if (titlesMatch()) appArt else artCache[musicTitle.trim().lowercase()]
+                musicArt = if (titlesMatch()) appArt else store.get(CoverStore.keyOf(musicTitle.trim()))
                 scheduleArt()
             }
         }
@@ -1092,38 +1093,55 @@ class BleLink(private val context: Context) {
         main.postDelayed(artRunnable, 500L)
     }
 
-    /** Gets the cover from the iPhone app and, when the watch has internet, straight from the web. */
+    /** Saved cover first (instant), then the iPhone app and the web. */
     private fun requestArtwork() {
         val title = musicTitle.trim()
         if (title.isEmpty()) return
         val artist = musicArtist.trim()
-        val lower = title.lowercase()
-        val key = lower + "|" + artist.lowercase()
+        val key = CoverStore.keyOf(title)
+        val sig = key + "|" + artist.lowercase()
         val now = SystemClock.elapsedRealtime()
-        if (key == lastArtKey && (artCache.containsKey(lower) || now - lastArtAsk < 20000L)) return
-        lastArtKey = key
-        lastArtAsk = now
-        val cached = artCache[lower]
-        if (cached != null) {
-            musicArt = cached
+        val have = store.get(key)
+        if (have != null) {
+            musicArt = have
             changed()
+            if (sig != lastArtKey) {
+                lastArtKey = sig
+                afterSongStart(title, artist)
+            }
             return
         }
+        if (sig == lastArtKey && now - lastArtAsk < 20000L) return
+        lastArtKey = sig
+        lastArtAsk = now
         if (dataReady) {
             sendFrame(0x51, (title + "\n" + artist).toByteArray(Charsets.UTF_8))
         }
         ArtFetcher.fetch(title, artist) { bmp ->
             if (bmp != null) {
-                main.post {
-                    if (artCache.size > 30) artCache.clear()
-                    artCache[lower] = bmp
-                    if (musicTitle.trim().lowercase() == lower) {
-                        musicArt = bmp
-                    }
-                    changed()
-                }
+                main.post { storeCover(title, bmp) }
             }
         }
+        afterSongStart(title, artist)
+    }
+
+    private fun storeCover(title: String, bmp: Bitmap) {
+        val key = CoverStore.keyOf(title)
+        store.putPlayed(key, ArtFetcher.toJpeg(bmp))
+        if (CoverStore.keyOf(musicTitle) == key) {
+            musicArt = bmp
+        }
+        changed()
+    }
+
+    private fun afterSongStart(title: String, artist: String) {
+        val key = CoverStore.keyOf(title)
+        main.postDelayed({
+            if (CoverStore.keyOf(musicTitle) == key && musicPlaying) {
+                history.add(title, artist)
+            }
+        }, 20000L)
+        prefetcher.start(title, artist, batteryLevel in 0..19)
     }
 
     private fun amsCommand(id: Int) {

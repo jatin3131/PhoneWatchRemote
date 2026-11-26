@@ -528,7 +528,7 @@ class MainActivity : ComponentActivity() {
                 fontSize = 14.sp
             )
             Text(
-                text = (if (connected) (if (link.dataReady) "data link ready" else "data link not ready") else link.status) + "  |  watch v13  |  media: " + link.amsStatus,
+                text = (if (connected) (if (link.dataReady) "data link ready" else "data link not ready") else link.status) + "  |  watch v14  |  media: " + link.amsStatus,
                 fontSize = 9.sp,
                 color = Color(0xFFAAAAAA),
                 textAlign = TextAlign.Center,
