@@ -127,6 +127,7 @@ class BleLink(private val context: Context) {
     private var appArt: Bitmap? = null
     private val artCache = HashMap<String, Bitmap>()
     private var lastArtKey = ""
+    private var lastArtAsk = 0L
 
     private var phoneDevice: BluetoothDevice? = null
     private var clientGatt: BluetoothGatt? = null
@@ -1052,26 +1053,56 @@ class BleLink(private val context: Context) {
         } else if (entity == 2) {
             when (attr) {
                 0 -> musicArtist = value
-                2 -> {
-                    musicTitle = value
-                    requestArtwork()
-                }
+                2 -> musicTitle = value
                 3 -> musicDurationSec = (value.trim().toDoubleOrNull() ?: 0.0).toInt()
             }
-            musicArt = if (titlesMatch()) appArt else artCache[musicTitle.trim().lowercase()]
+            if (attr == 0 || attr == 2) {
+                musicArt = if (titlesMatch()) appArt else artCache[musicTitle.trim().lowercase()]
+                scheduleArt()
+            }
         }
         changed()
     }
 
-    /** Asks the iPhone app to look up the cover for the current song. */
+    private val artRunnable = Runnable { requestArtwork() }
+
+    private fun scheduleArt() {
+        main.removeCallbacks(artRunnable)
+        main.postDelayed(artRunnable, 500L)
+    }
+
+    /** Gets the cover from the iPhone app and, when the watch has internet, straight from the web. */
     private fun requestArtwork() {
         val title = musicTitle.trim()
-        if (title.isEmpty() || !dataReady) return
-        val key = title.lowercase() + "|" + musicArtist.trim().lowercase()
-        if (key == lastArtKey) return
+        if (title.isEmpty()) return
+        val artist = musicArtist.trim()
+        val lower = title.lowercase()
+        val key = lower + "|" + artist.lowercase()
+        val now = SystemClock.elapsedRealtime()
+        if (key == lastArtKey && (artCache.containsKey(lower) || now - lastArtAsk < 20000L)) return
         lastArtKey = key
-        if (artCache.containsKey(title.lowercase())) return
-        sendFrame(0x51, (title + "\n" + musicArtist.trim()).toByteArray(Charsets.UTF_8))
+        lastArtAsk = now
+        val cached = artCache[lower]
+        if (cached != null) {
+            musicArt = cached
+            changed()
+            return
+        }
+        if (dataReady) {
+            sendFrame(0x51, (title + "\n" + artist).toByteArray(Charsets.UTF_8))
+        }
+        ArtFetcher.fetch(title, artist) { bmp ->
+            if (bmp != null) {
+                main.post {
+                    if (artCache.size > 30) artCache.clear()
+                    artCache[lower] = bmp
+                    if (musicTitle.trim().lowercase() == lower) {
+                        musicArt = bmp
+                    }
+                    changed()
+                }
+            }
+        }
     }
 
     private fun amsCommand(id: Int) {

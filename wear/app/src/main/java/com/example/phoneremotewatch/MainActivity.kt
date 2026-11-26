@@ -95,56 +95,77 @@ private fun norm(value: Float, total: Int): Int {
     return ((value / total.toFloat()) * 999f).toInt().coerceIn(0, 999)
 }
 
-private class Palette(val top: Color, val bottom: Color, val light: Boolean)
+private class Palette(val top: Color, val mid: Color, val bottom: Color)
 
 private fun lumaOf(r: Int, g: Int, b: Int): Float {
     return (0.299f * r + 0.587f * g + 0.114f * b) / 255f
 }
 
-/** Finds the two most frequent colours of a cover. Near-black counts as one colour; if it wins, the result is white. */
+private fun tone(c: Triple<Int, Int, Int>, cap: Float): Color {
+    val l = lumaOf(c.first, c.second, c.third)
+    val f = if (l > cap) cap / l else 1f
+    return Color(
+        (c.first * f).toInt().coerceIn(0, 255),
+        (c.second * f).toInt().coerceIn(0, 255),
+        (c.third * f).toInt().coerceIn(0, 255)
+    )
+}
+
+/** Top colours of a cover. Near-black and near-white are skipped; colours are kept dark enough for white text. */
 private fun paletteFrom(src: Bitmap): Palette? {
     try {
-        val small = Bitmap.createScaledBitmap(src, 24, 24, true)
-        val px = IntArray(24 * 24)
-        small.getPixels(px, 0, 24, 0, 0, 24, 24)
+        val small = Bitmap.createScaledBitmap(src, 32, 32, true)
+        val px = IntArray(32 * 32)
+        small.getPixels(px, 0, 32, 0, 0, 32, 32)
         val counts = HashMap<Int, Int>()
-        val sumR = HashMap<Int, Int>()
-        val sumG = HashMap<Int, Int>()
-        val sumB = HashMap<Int, Int>()
+        val sr = HashMap<Int, Int>()
+        val sg = HashMap<Int, Int>()
+        val sb = HashMap<Int, Int>()
+        var dark = 0
+        var bright = 0
         for (p in px) {
             val r = (p shr 16) and 0xFF
             val g = (p shr 8) and 0xFF
             val b = p and 0xFF
-            val key = if (maxOf(r, g, b) < 48) -1 else ((r shr 4) shl 8) or ((g shr 4) shl 4) or (b shr 4)
+            if (maxOf(r, g, b) < 55) {
+                dark++
+                continue
+            }
+            if (minOf(r, g, b) > 215) {
+                bright++
+                continue
+            }
+            val key = ((r shr 5) shl 6) or ((g shr 5) shl 3) or (b shr 5)
             counts[key] = (counts[key] ?: 0) + 1
-            sumR[key] = (sumR[key] ?: 0) + r
-            sumG[key] = (sumG[key] ?: 0) + g
-            sumB[key] = (sumB[key] ?: 0) + b
+            sr[key] = (sr[key] ?: 0) + r
+            sg[key] = (sg[key] ?: 0) + g
+            sb[key] = (sb[key] ?: 0) + b
         }
-        val ordered = counts.entries.sortedByDescending { it.value }
-        if (ordered.isEmpty()) return null
-        val topKey = ordered[0].key
-        if (topKey == -1) {
-            return Palette(Color(0xFFFFFFFF), Color(0xFFE4E4EA), true)
+        val picks = ArrayList<Triple<Int, Int, Int>>()
+        for (e in counts.entries.sortedByDescending { it.value }) {
+            val n = e.value
+            val c = Triple((sr[e.key] ?: 0) / n, (sg[e.key] ?: 0) / n, (sb[e.key] ?: 0) / n)
+            var distinct = true
+            for (q in picks) {
+                if (abs(q.first - c.first) + abs(q.second - c.second) + abs(q.third - c.third) < 90) {
+                    distinct = false
+                    break
+                }
+            }
+            if (distinct) picks.add(c)
+            if (picks.size == 3) break
         }
-        fun avg(key: Int): Triple<Int, Int, Int> {
-            val n = counts[key] ?: 1
-            return Triple((sumR[key] ?: 0) / n, (sumG[key] ?: 0) / n, (sumB[key] ?: 0) / n)
-        }
-        val a = avg(topKey)
-        var second: Triple<Int, Int, Int>? = null
-        for (e in ordered) {
-            if (e.key == topKey || e.key == -1) continue
-            val c = avg(e.key)
-            val d = abs(c.first - a.first) + abs(c.second - a.second) + abs(c.third - a.third)
-            if (d > 90) {
-                second = c
-                break
+        if (picks.isEmpty()) {
+            return if (bright >= dark) {
+                Palette(Color(0xFF8E8E98), Color(0xFF63636C), Color(0xFF3A3A42))
+            } else {
+                Palette(Color(0xFF34343C), Color(0xFF24242A), Color(0xFF141418))
             }
         }
-        val s = second ?: Triple(a.first * 55 / 100, a.second * 55 / 100, a.third * 55 / 100)
-        val light = (0.6f * lumaOf(a.first, a.second, a.third) + 0.4f * lumaOf(s.first, s.second, s.third)) > 0.55f
-        return Palette(Color(a.first, a.second, a.third), Color(s.first, s.second, s.third), light)
+        val c1 = picks[0]
+        val c2 = if (picks.size > 1) picks[1] else Triple(c1.first * 70 / 100, c1.second * 70 / 100, c1.third * 70 / 100)
+        val c3 = if (picks.size > 2) picks[2] else Triple(c2.first * 65 / 100, c2.second * 65 / 100, c2.third * 65 / 100)
+        return Palette(tone(c1, 0.5f), tone(c2, 0.42f), tone(c3, 0.3f))
     } catch (e: Exception) {
         return null
     }
@@ -484,7 +505,7 @@ class MainActivity : ComponentActivity() {
                 fontSize = 14.sp
             )
             Text(
-                text = (if (connected) (if (link.dataReady) "data link ready" else "data link not ready") else link.status) + "  |  watch v11  |  media: " + link.amsStatus,
+                text = (if (connected) (if (link.dataReady) "data link ready" else "data link not ready") else link.status) + "  |  watch v12  |  media: " + link.amsStatus,
                 fontSize = 9.sp,
                 color = Color(0xFFAAAAAA),
                 textAlign = TextAlign.Center,
@@ -949,7 +970,8 @@ class MainActivity : ComponentActivity() {
         val palette = remember(art) { if (art != null) paletteFrom(art) else null }
         val topColor by animateColorAsState(palette?.top ?: Color(0xFF3B2A4A), tween(700), label = "top")
         val bottomColor by animateColorAsState(palette?.bottom ?: Color(0xFF16161A), tween(700), label = "bottom")
-        val light = palette?.light ?: false
+        val midColor by animateColorAsState(palette?.mid ?: Color(0xFF28202F), tween(700), label = "mid")
+        val light = false
         val ink = if (light) Color(0xFF15151A) else Color.White
         val inkSoft = if (light) Color(0xFF55555C) else Color(0xFFBBBBBB)
         val inkFaint = if (light) Color(0xFF777780) else Color(0xFF8A8A8E)
@@ -981,7 +1003,7 @@ class MainActivity : ComponentActivity() {
         Box(
             modifier = Modifier
                 .fillMaxSize()
-                .background(Brush.verticalGradient(listOf(topColor, bottomColor)))
+                .background(Brush.verticalGradient(listOf(topColor, midColor, bottomColor)))
                 .onRotaryScrollEvent { event ->
                     acc += event.verticalScrollPixels
                     if (abs(acc) >= 10f) {
